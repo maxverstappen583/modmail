@@ -11,7 +11,7 @@ from flask import Flask
 from threading import Thread
 
 # ----------------- CONFIG -----------------
-OWNER_ID = 1319292111325106296,1380315427992768633,285323814991167489     # your user id (owner)
+OWNER_ID = 1319292111325106296 1380315427992768633 285323814991167489     # your user id (owner)
 GUILD_ID = 1364371104755613837     # <<--- REPLACE this with your server ID (int)
 TOKEN = os.getenv("DISCORD_BOT_TOKEN")  # put your token in env var
 
