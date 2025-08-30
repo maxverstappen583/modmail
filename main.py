@@ -8,7 +8,7 @@ from threading import Thread
 
 # ---------- EDIT THESE ----------
 OWNER_ID = 1319292111325106296          # you
-GUILD_ID = 123456789012345678           # your server ID
+GUILD_ID = 1364371104755613837          # your server ID
 TOKEN    = os.getenv("DISCORD_BOT_TOKEN")
 # ---------------------------------
 
