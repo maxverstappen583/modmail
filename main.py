@@ -6,7 +6,7 @@ from flask import Flask
 import threading
 
 TOKEN = os.getenv("DISCORD_BOT_TOKEN")
-GUILD_ID = 123456789012345678  # replace with your server ID
+GUILD_ID = 1364371104755613837  # replace with your server ID
 OWNER_ID = 1319292111325106296  # you only
 
 intents = discord.Intents.default()
