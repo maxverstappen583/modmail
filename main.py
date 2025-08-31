@@ -9,11 +9,11 @@ from typing import Optional, Tuple
 
 # ---------------- CONFIG - EDIT THESE ----------------
 OWNER_ID = 1319292111325106296
-GUILD_ID = 123456789012345678   # <<--- REPLACE this with your server ID (int)
+GUILD_ID = 1364371104755613837   # <<--- REPLACE this with your server ID (int)
 TOKEN = os.getenv("DISCORD_BOT_TOKEN")  # set in env
 
 CONFIG_FILE = "config.json"
-FOOTER_IMAGE_PATH = "/mnt/data/DEBEC8AF-40C2-421C-8F41-B606AB6A6072.jpeg"  # keep as-is if file exists there
+FOOTER_IMAGE_PATH = "https://i.postimg.cc/rp5b7Jkn/IMG-6152.jpg"  # keep as-is if file exists there
 FOOTER_ATTACHMENT_NAME = "footer.png"
 FOOTER_TEXT = "@ u4_straight1"
 
