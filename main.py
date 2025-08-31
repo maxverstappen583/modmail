@@ -13,7 +13,7 @@ GUILD_ID = 1364371104755613837   # <<< your server ID (locked to this guild)
 TOKEN = os.getenv("DISCORD_BOT_TOKEN")  # set this in your host env
 
 CONFIG_FILE = "config.json"
-FOOTER_IMAGE_PATH = "/mnt/data/DEBEC8AF-40C2-421C-8F41-B606AB6A6072.jpeg"
+FOOTER_IMAGE_PATH = "https://i.postimg.cc/rp5b7Jkn/IMG-6152.jpg"
 FOOTER_ATTACHMENT_NAME = "footer.png"
 FOOTER_TEXT = "@ u4_straight1"
 
