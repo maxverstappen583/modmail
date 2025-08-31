@@ -30,7 +30,7 @@ def run_flask():
 
 Thread(target=run_flask).start()
 
-# ===== SETTINGS STORAGE =====
+# ===== SETTINGS =====
 SETTINGS_FILE = "modmail_settings.json"
 if not os.path.exists(SETTINGS_FILE):
     with open(SETTINGS_FILE, "w") as f:
@@ -48,17 +48,7 @@ def save_settings(settings):
 intents = discord.Intents.all()
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# ===== GUILD CHECK DECORATORS =====
-def guild_only_command():
-    async def predicate(ctx):
-        if ctx.guild is None:
-            return True  # Allow DM commands
-        if ctx.guild.id != GUILD_ID:
-            await ctx.send(OTHER_GUILD_RESPONSE, ephemeral=True)
-            return False
-        return True
-    return commands.check(predicate)
-
+# ===== GUILD CHECKS =====
 def guild_only_app():
     async def check(interaction: discord.Interaction) -> bool:
         if interaction.guild is None:
@@ -69,7 +59,7 @@ def guild_only_app():
         return True
     return app_commands.check(check)
 
-# ===== EMBED HELPER =====
+# ===== EMBED HELPERS =====
 def get_embed_color(member: discord.Member):
     for role in reversed(member.roles):
         if role.color.value != 0:
@@ -96,8 +86,7 @@ async def summarize_problem(messages):
             max_tokens=150
         )
         return response.choices[0].message.content.strip()
-    except Exception as e:
-        print("OpenAI API error:", e)
+    except:
         return "Problem could not be automatically detected."
 
 async def create_ticket_channel(guild: discord.Guild, user: discord.User, settings):
@@ -217,25 +206,11 @@ async def on_message(message):
 
     await bot.process_commands(message)
 
-# ===== Typing indicator =====
-@bot.event
-async def on_typing(channel, user, when):
-    if user.bot:
-        return
-    if isinstance(channel, discord.DMChannel):
-        settings = load_settings()
-        active_tickets = settings.get("active_tickets", {})
-        if str(user.id) in active_tickets:
-            ticket_channel = bot.get_guild(GUILD_ID).get_channel(active_tickets[str(user.id)])
-            if ticket_channel:
-                async with ticket_channel.typing():
-                    await asyncio.sleep(2)
-
 # ===== COMMANDS =====
-@bot.command()
-@guild_only_command()
-async def refresh(ctx):
-    await ctx.send("Panel refreshed ✅")
+@bot.tree.command(name="refresh")
+@guild_only_app()
+async def refresh(interaction: discord.Interaction):
+    await interaction.response.send_message("Panel refreshed ✅")
 
 @bot.tree.command(name="send_panel")
 @guild_only_app()
@@ -293,11 +268,13 @@ async def set_cooldown(interaction: discord.Interaction, seconds: int):
     save_settings(settings)
     await interaction.response.send_message(f"Cooldown set to {seconds} seconds ✅", ephemeral=True)
 
-# ===== SYNC SLASH COMMANDS =====
+# ===== ON_READY =====
 @bot.event
 async def on_ready():
     print(f"{bot.user} is online and ready!")
     await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.watching, name="Mod Mail"))
+
+    # Sync commands to guild
     guild = discord.Object(id=GUILD_ID)
     try:
         await bot.tree.sync(guild=guild)
