@@ -1,4 +1,3 @@
-# main.py
 import discord
 from discord.ext import commands
 from discord import ui, ButtonStyle
@@ -18,10 +17,16 @@ openai.api_key = OPENAI_API_KEY
 
 # ===== FLASK =====
 app = Flask("")
+
 @app.route('/')
 def home():
     return "Bot is running!"
-Thread(target=lambda: app.run(host="0.0.0.0", port=int(os.environ.get("PORT",8080)))).start()
+
+def run_flask():
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=port)
+
+Thread(target=run_flask).start()
 
 # ===== SETTINGS STORAGE =====
 SETTINGS_FILE = "modmail_settings.json"
@@ -41,16 +46,25 @@ def save_settings(settings):
 intents = discord.Intents.all()
 bot = commands.Bot(command_prefix="!", intents=intents)
 
+@bot.event
+async def on_ready():
+    print(f"{bot.user} is online and ready!")
+    await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.watching, name="Mod Mail"))
+
 # ===== HELPER FUNCTIONS =====
 async def summarize_problem(messages):
     text = "\n".join(messages[-20:])
     prompt = f"Summarize the following messages as the user's problem in one concise paragraph:\n{text}"
-    response = openai.ChatCompletion.create(
-        model="gpt-3.5-turbo",
-        messages=[{"role": "user", "content": prompt}],
-        max_tokens=150
-    )
-    return response.choices[0].message.content.strip()
+    try:
+        response = openai.ChatCompletion.create(
+            model="gpt-3.5-turbo",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=150
+        )
+        return response.choices[0].message.content.strip()
+    except Exception as e:
+        print("OpenAI API error:", e)
+        return "Problem could not be automatically detected."
 
 async def mark_ticket_solved(channel: discord.TextChannel, user: discord.Member):
     overwrites = channel.overwrites
@@ -59,10 +73,7 @@ async def mark_ticket_solved(channel: discord.TextChannel, user: discord.Member)
 
     messages = await channel.history(limit=50, oldest_first=True).flatten()
     user_messages = [msg.content for msg in messages if msg.author == user]
-    if not user_messages:
-        problem_text = "No messages detected."
-    else:
-        problem_text = await summarize_problem(user_messages)
+    problem_text = await summarize_problem(user_messages) if user_messages else "No messages detected."
 
     embed = discord.Embed(
         title="Ticket Resolved",
@@ -84,7 +95,6 @@ class CloseButton(ui.View):
         if staff_role.id not in [role.id for role in interaction.user.roles]:
             await interaction.response.send_message("Only staff can close tickets.", ephemeral=True)
             return
-        settings = load_settings()
         active_tickets = settings.get("active_tickets", {})
         for user_id, ch_id in list(active_tickets.items()):
             if ch_id == self.channel.id:
@@ -110,15 +120,60 @@ class SolvedButton(ui.View):
         await interaction.message.edit(view=None)
         await interaction.response.send_message("Ticket locked and ready to be closed.", ephemeral=True)
 
+# ===== DM CONFIRMATION =====
+class TicketConfirm(ui.View):
+    def __init__(self, user, ctx):
+        super().__init__(timeout=60)
+        self.user = user
+        self.ctx = ctx
+        self.value = None
+
+    @ui.button(label="✅ Confirm", style=ButtonStyle.green)
+    async def confirm(self, interaction: discord.Interaction, button: ui.Button):
+        if interaction.user != self.user:
+            await interaction.response.send_message("This is not for you.", ephemeral=True)
+            return
+        self.value = True
+        self.stop()
+        await interaction.response.send_message("Ticket confirmed! Creating your ticket...", ephemeral=True)
+
+    @ui.button(label="❎ Cancel", style=ButtonStyle.red)
+    async def cancel(self, interaction: discord.Interaction, button: ui.Button):
+        if interaction.user != self.user:
+            await interaction.response.send_message("This is not for you.", ephemeral=True)
+            return
+        self.value = False
+        self.stop()
+        await interaction.response.send_message("Ticket creation canceled.", ephemeral=True)
+
 # ===== SLASH COMMANDS =====
 @bot.slash_command(description="Open a support ticket")
 async def ticket(ctx: discord.ApplicationContext):
     settings = load_settings()
     active_tickets = settings.get("active_tickets", {})
+
     if str(ctx.user.id) in active_tickets:
         await ctx.respond("You already have an open ticket.", ephemeral=True)
         return
 
+    try:
+        view = TicketConfirm(ctx.user, ctx)
+        dm = await ctx.user.send("Do you want to open a support ticket? Click ✅ to confirm or ❎ to cancel.", view=view)
+        await view.wait()
+
+        if view.value is None:
+            await ctx.user.send("Ticket creation timed out. Please try again.")
+            await ctx.respond("Ticket creation timed out. Check your DMs.", ephemeral=True)
+            return
+        elif view.value is False:
+            await ctx.respond("Ticket creation canceled.", ephemeral=True)
+            return
+
+    except discord.Forbidden:
+        await ctx.respond("I cannot DM you! Please enable DMs from server members.", ephemeral=True)
+        return
+
+    # Create ticket
     category_id = int(settings.get("ticket_category", 0))
     category = discord.utils.get(ctx.guild.categories, id=category_id)
     if category is None:
@@ -167,40 +222,40 @@ async def settings(ctx: discord.ApplicationContext):
 
 @bot.slash_command(description="Set the staff role (admin only)")
 async def set_staff_role(ctx: discord.ApplicationContext, role: discord.Role):
-    settings_data = load_settings()
     if not ctx.user.guild_permissions.administrator:
         await ctx.respond("Only admins can use this.", ephemeral=True)
         return
+    settings_data = load_settings()
     settings_data["staff_role"] = role.id
     save_settings(settings_data)
     await ctx.respond(f"Staff role set to {role.mention}", ephemeral=True)
 
 @bot.slash_command(description="Set the log channel (admin only)")
 async def set_log_channel(ctx: discord.ApplicationContext, channel: discord.TextChannel):
-    settings_data = load_settings()
     if not ctx.user.guild_permissions.administrator:
         await ctx.respond("Only admins can use this.", ephemeral=True)
         return
+    settings_data = load_settings()
     settings_data["log_channel"] = channel.id
     save_settings(settings_data)
     await ctx.respond(f"Log channel set to {channel.mention}", ephemeral=True)
 
 @bot.slash_command(description="Set ticket category (admin only)")
 async def set_category(ctx: discord.ApplicationContext, category: discord.CategoryChannel):
-    settings_data = load_settings()
     if not ctx.user.guild_permissions.administrator:
         await ctx.respond("Only admins can use this.", ephemeral=True)
         return
+    settings_data = load_settings()
     settings_data["ticket_category"] = category.id
     save_settings(settings_data)
     await ctx.respond(f"Ticket category set to {category.name}", ephemeral=True)
 
-@bot.slash_command(description="Set ticket cooldown (admin only)")
+@bot.slash_command(description="Set ticket cooldown in seconds (admin only)")
 async def set_cooldown(ctx: discord.ApplicationContext, seconds: int):
-    settings_data = load_settings()
     if not ctx.user.guild_permissions.administrator:
         await ctx.respond("Only admins can use this.", ephemeral=True)
         return
+    settings_data = load_settings()
     settings_data["cooldown"] = seconds
     save_settings(settings_data)
     await ctx.respond(f"Ticket cooldown set to {seconds} seconds.", ephemeral=True)
@@ -220,15 +275,11 @@ async def send_panel(ctx: discord.ApplicationContext):
 async def refresh(ctx: discord.ApplicationContext):
     settings = load_settings()
     staff_role = ctx.guild.get_role(int(settings.get("staff_role", 0)))
-    
-    # Delete all previous mod mail panels by the bot in the last 100 messages
     async for message in ctx.channel.history(limit=100):
         if message.author == bot.user and message.embeds:
             embed = message.embeds[0]
             if embed.title == "Mod Mail Panel":
                 await message.delete()
-    
-    # Send new panel
     embed = discord.Embed(
         title="Mod Mail Panel",
         description=f"Click below to open a ticket.\nStaff: {staff_role.mention}",
