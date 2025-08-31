@@ -1,2 +1,4 @@
-discord.py
-flask
+discord.py>=2.6.0
+openai>=1.8.0
+python-dotenv>=1.0.0
+Flask>=2.3.3
