@@ -13,7 +13,7 @@ import tempfile
 import datetime
 
 # ========== CONFIG ==========
-TOKEN = "YOUR_BOT_TOKEN"  # <-- replace with your bot token
+TOKEN = os.getenv("DISCORD_BOT_TOKEN")  # <-- replace with your bot token
 GUILD_ID = 1364371104755613837  # locked to your server
 CONFIG_FILE = "config.json"
 DM_COUNTDOWN = 15  # seconds countdown in DM before auto-create
