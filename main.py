@@ -1,516 +1,459 @@
-# main.py
 import discord
 from discord.ext import commands
 from discord import app_commands, ui
-import asyncio
-import json
-import os
-import tempfile
-import datetime
+import asyncio, datetime, json, os, tempfile
+from typing import Optional, Tuple
 from flask import Flask
 from threading import Thread
 
-# ----------------- CONFIG -----------------
-OWNER_ID = 1319292111325106296     # your user id (owner)
-GUILD_ID = 1364371104755613837     # <<--- REPLACE this with your server ID (int)
-TOKEN = os.getenv("DISCORD_BOT_TOKEN")  # put your token in env var
-
+# ============ BASIC CONFIG ============
+OWNER_ID = 1319292111325106296  # You (still allowed everywhere)
+TOKEN = os.getenv("DISCORD_BOT_TOKEN")  # set in your hosting env
 CONFIG_FILE = "config.json"
-DM_CONFIRM_TIMEOUT = 15            # seconds to confirm DM ticket creation
-MODMAIL_COOLDOWN = 300             # 5 minutes cooldown for /modmail
 
-# ----------------- FLASK KEEPALIVE -----------------
+DM_COUNTDOWN_SECONDS = 15         # live countdown in DM
+MODMAIL_COOLDOWN = 300            # 5 minutes (applies to /modmail and panel clicks)
+
+# ============ FLASK KEEP-ALIVE ============
 app = Flask(__name__)
 @app.route("/")
 def home():
     return "ModMail bot is alive"
+Thread(target=lambda: app.run(host="0.0.0.0", port=10000), daemon=True).start()
 
-def _run_flask():
-    app.run(host="0.0.0.0", port=10000)
+# ============ STORAGE ============
+def _default_guild_cfg():
+    return {"category_id": None, "staff_role_id": None, "log_channel_id": None, "tickets": {}}
 
-Thread(target=_run_flask, daemon=True).start()
-
-# ----------------- STATE / CONFIG -----------------
-def load_config():
+def load_cfg():
     if not os.path.exists(CONFIG_FILE):
-        base = {"category_id": None, "staff_role_id": None, "log_channel_id": None, "tickets": {}}
         with open(CONFIG_FILE, "w") as f:
-            json.dump(base, f, indent=4)
-        return base
+            json.dump({"guilds": {}}, f, indent=4)
     with open(CONFIG_FILE, "r") as f:
         return json.load(f)
 
-def save_config(cfg):
+def save_cfg(config):
     with open(CONFIG_FILE, "w") as f:
-        json.dump(cfg, f, indent=4)
+        json.dump(config, f, indent=4)
 
-cfg = load_config()  # cfg keys: category_id, staff_role_id, log_channel_id, tickets { user_id: channel_id }
+cfg = load_cfg()  # { "guilds": { str(guild_id): {category_id, staff_role_id, log_channel_id, tickets{user_id: channel_id}} } }
 
-# ----------------- BOT SETUP -----------------
+def gcfg(guild: discord.Guild) -> dict:
+    gid = str(guild.id)
+    if "guilds" not in cfg: cfg["guilds"] = {}
+    if gid not in cfg["guilds"]:
+        cfg["guilds"][gid] = _default_guild_cfg()
+        save_cfg(cfg)
+    return cfg["guilds"][gid]
+
+# ============ BOT ============
 intents = discord.Intents.all()
 bot = commands.Bot(command_prefix="!", intents=intents)
 tree = bot.tree
+_last_open = {}  # cooldown: {(guild_id, user_id): timestamp}
 
-# cooldown state for /modmail
-_modmail_timestamps = {}  # user_id -> last_time
+# ============ HELPERS ============
+def is_owner(u: discord.abc.Snowflake) -> bool:
+    return getattr(u, "id", None) == OWNER_ID
 
-# ----------------- HELPERS -----------------
-def is_owner_user(user: discord.abc.Snowflake) -> bool:
-    return getattr(user, "id", None) == OWNER_ID
+def is_admin_or_owner(inter: discord.Interaction) -> bool:
+    if is_owner(inter.user): return True
+    m = inter.user if isinstance(inter.user, discord.Member) else None
+    return bool(m and m.guild_permissions.administrator)
 
-def staff_role_object(guild: discord.Guild):
-    rid = cfg.get("staff_role_id")
+def staff_role(guild: discord.Guild) -> Optional[discord.Role]:
+    rid = gcfg(guild).get("staff_role_id")
     return guild.get_role(rid) if rid else None
 
-def category_object(guild: discord.Guild):
-    cid = cfg.get("category_id")
-    return guild.get_channel(cid) if cid else None
-
-def log_channel_object(guild: discord.Guild):
-    lid = cfg.get("log_channel_id")
+def log_channel(guild: discord.Guild) -> Optional[discord.TextChannel]:
+    lid = gcfg(guild).get("log_channel_id")
     return guild.get_channel(lid) if lid else None
 
-def user_has_staff_role(member: discord.Member) -> bool:
-    rid = cfg.get("staff_role_id")
-    if rid is None:
-        return False
-    return any(r.id == rid for r in member.roles) or member.id == OWNER_ID
+def category(guild: discord.Guild) -> Optional[discord.CategoryChannel]:
+    cid = gcfg(guild).get("category_id")
+    ch = guild.get_channel(cid) if cid else None
+    return ch if isinstance(ch, discord.CategoryChannel) else None
 
-def make_user_embed_for_ticket(user: discord.User, content: str) -> discord.Embed:
-    e = discord.Embed(description=content or "‎", color=discord.Color.blue(), timestamp=datetime.datetime.utcnow())
+def has_staff(member: discord.Member) -> bool:
+    sr = staff_role(member.guild)
+    return bool(sr and sr in member.roles) or member.guild_permissions.administrator or member.id == OWNER_ID
+
+def in_cooldown(guild_id: int, user_id: int) -> int:
+    key = (guild_id, user_id)
+    now = asyncio.get_event_loop().time()
+    last = _last_open.get(key, 0)
+    left = int(MODMAIL_COOLDOWN - (now - last))
+    return max(0, left)
+
+def start_cooldown(guild_id: int, user_id: int):
+    _last_open[(guild_id, user_id)] = asyncio.get_event_loop().time()
+
+def user_embed(user: discord.User, content: str) -> discord.Embed:
+    e = discord.Embed(description=content or "‎", color=discord.Color.blurple(), timestamp=datetime.datetime.utcnow())
     e.set_author(name=str(user), icon_url=user.display_avatar.url if hasattr(user, "display_avatar") else None)
     return e
 
-def make_staff_embed_for_user(staff: discord.Member, content: str) -> discord.Embed:
+def staff_embed(author: discord.Member, content: str) -> discord.Embed:
     e = discord.Embed(description=content or "‎", color=discord.Color.orange(), timestamp=datetime.datetime.utcnow())
-    e.set_author(name=str(staff), icon_url=staff.display_avatar.url if hasattr(staff, "display_avatar") else None)
+    e.set_author(name=str(author), icon_url=author.display_avatar.url if hasattr(author, "display_avatar") else None)
     return e
 
-async def create_transcript(channel: discord.TextChannel) -> str:
-    """Return path to a transcript .txt file for the channel (history oldest->newest)."""
-    lines = []
-    async for m in channel.history(limit=None, oldest_first=True):
-        ts = m.created_at.strftime("%Y-%m-%d %H:%M:%S")
-        author = f"{m.author} ({m.author.id})"
-        content = m.content or ""
-        lines.append(f"[{ts}] {author}: {content}")
-        for a in m.attachments:
-            lines.append(f"    [attachment] {a.url}")
-    text = "\n".join(lines)
-    fd, path = tempfile.mkstemp(prefix=f"transcript_{channel.id}_", suffix=".txt")
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        f.write(text)
-    return path
-
-async def send_log_embed(guild: discord.Guild, embed: discord.Embed, file_path: str = None):
-    ch = log_channel_object(guild)
-    if not ch:
-        return
+async def send_log(guild: discord.Guild, embed: discord.Embed, file_path: Optional[str] = None):
+    ch = log_channel(guild)
+    if not ch: return
     try:
         if file_path:
             await ch.send(embed=embed, file=discord.File(file_path))
         else:
             await ch.send(embed=embed)
     except Exception as e:
-        print("Failed to send log:", e)
+        print("Log send failed:", e)
 
-# ----------------- UI / Views -----------------
-class DMConfirmView(ui.View):
-    def __init__(self, user: discord.User, original_message: discord.Message):
-        super().__init__(timeout=DM_CONFIRM_TIMEOUT)
-        self.requester = user
-        self.original_message = original_message
-        self.result = None  # "confirm" or "cancel" or None
+async def build_transcript(channel: discord.TextChannel) -> str:
+    lines = []
+    async for m in channel.history(limit=None, oldest_first=True):
+        ts = m.created_at.strftime("%Y-%m-%d %H:%M:%S")
+        who = f"{m.author} ({m.author.id})"
+        lines.append(f"[{ts}] {who}: {m.content}")
+        for a in m.attachments:
+            lines.append(f"    [attachment] {a.url}")
+    fd, path = tempfile.mkstemp(prefix=f"transcript_{channel.id}_", suffix=".txt")
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+    return path
 
-    @ui.button(label="Create Ticket", style=discord.ButtonStyle.green)
-    async def confirm(self, interaction: discord.Interaction, button: ui.Button):
-        if interaction.user.id != self.requester.id:
-            return await interaction.response.send_message("This confirmation isn't for you.", ephemeral=True)
-        self.result = "confirm"
-        await interaction.response.send_message("✅ Creating ticket...", ephemeral=True)
-        self.stop()
+async def pick_target_guild_for_dm(user: discord.User) -> Optional[discord.Guild]:
+    """Pick the first mutual guild where bot has a configured category & staff role."""
+    for g in bot.guilds:
+        gc = gcfg(g)
+        if gc.get("category_id") and gc.get("staff_role_id"):
+            return g
+    return None
 
-    @ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
-    async def cancel(self, interaction: discord.Interaction, button: ui.Button):
-        if interaction.user.id != self.requester.id:
-            return await interaction.response.send_message("This cancellation isn't for you.", ephemeral=True)
-        self.result = "cancel"
-        await interaction.response.send_message("❌ Cancelled.", ephemeral=True)
-        self.stop()
+async def create_ticket(guild: discord.Guild, user: discord.User, opened_via: str) -> Tuple[Optional[discord.TextChannel], Optional[str]]:
+    gc = gcfg(guild)
+    cat = category(guild)
+    sr = staff_role(guild)
+    if not cat or not sr:
+        return None, "Ticket system not configured in this server."
 
-    async def on_timeout(self):
-        # notify user on timeout
+    # already open?
+    if str(user.id) in gc["tickets"]:
+        ch = guild.get_channel(gc["tickets"][str(user.id)])
+        return ch, "You already have an open ticket."
+
+    # Channel that is NOT visible to user
+    name = f"ticket-{user.name}".replace(" ", "-")[:90]
+    overwrites = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=False),
+        sr: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
+        guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
+        # NOTE: user explicitly has NO view permission here
+    }
+    ch = await guild.create_text_channel(name=name, category=cat, overwrites=overwrites, topic=str(user.id))
+
+    gc["tickets"][str(user.id)] = ch.id
+    save_cfg(cfg)
+
+    await ch.send(f"{sr.mention} 📬 New ticket opened by **{user}** via **{opened_via}** (user cannot view this channel).")
+    emb = discord.Embed(title="Ticket Opened", color=discord.Color.green(), timestamp=datetime.datetime.utcnow())
+    emb.add_field(name="User", value=f"{user} ({user.id})", inline=False)
+    emb.add_field(name="Channel", value=ch.mention, inline=False)
+    emb.add_field(name="Opened via", value=opened_via, inline=True)
+    await send_log(guild, emb)
+    return ch, None
+
+async def close_ticket(guild: discord.Guild, channel: discord.TextChannel, closed_by: discord.Member):
+    gc = gcfg(guild)
+    uid = None
+    if channel.topic and channel.topic.isdigit():
+        uid = channel.topic
+    if not uid:
+        for k, v in gc["tickets"].items():
+            if v == channel.id:
+                uid = k
+                break
+
+    # transcript + log
+    transcript = None
+    try:
+        transcript = await build_transcript(channel)
+    except Exception as e:
+        print("Transcript error:", e)
+
+    e = discord.Embed(title="Ticket Closed", color=discord.Color.red(), timestamp=datetime.datetime.utcnow())
+    e.add_field(name="Channel", value=channel.name, inline=True)
+    e.add_field(name="Closed by", value=str(closed_by), inline=True)
+    if uid:
+        e.add_field(name="User ID", value=uid, inline=True)
         try:
-            await self.requester.send("⌛ Ticket creation timed out. Send another message to try again.")
-        except:
-            pass
+            u = await bot.fetch_user(int(uid))
+            try: await u.send("✅ Your ticket has been closed by staff.")
+            except: pass
+        except: pass
+    await send_log(guild, e, file_path=transcript)
 
+    if uid: gc["tickets"].pop(str(uid), None); save_cfg(cfg)
+    try: await channel.delete()
+    except: pass
+    if transcript:
+        try: os.remove(transcript)
+        except: pass
+
+# ============ UI (Panel) ============
 class PanelView(ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
     @ui.button(label="🎟 Create Ticket", style=discord.ButtonStyle.green, custom_id="panel_create_ticket")
-    async def create_ticket_button(self, interaction: discord.Interaction, button: ui.Button):
-        # create ticket flow (reuse create_ticket_for_user)
-        await interaction.response.defer(ephemeral=True)
-        await create_ticket_for_user(interaction.user, interaction.guild, opened_via="button")
-        await interaction.followup.send("✅ If configured, your ticket has been created. Check DMs.", ephemeral=True)
+    async def create_ticket_btn(self, interaction: discord.Interaction, button: ui.Button):
+        # cooldown check
+        left = in_cooldown(interaction.guild.id, interaction.user.id)
+        if left > 0:
+            return await interaction.response.send_message(f"⏳ Please wait **{left}s** before opening another ticket.", ephemeral=True)
 
-# ----------------- CORE: create ticket -----------------
-async def create_ticket_for_user(user: discord.User, guild: discord.Guild, opened_via: str = "command", first_message: discord.Message = None):
-    """Creates a ticket channel for user in guild. Returns channel or None and error message."""
-    if guild.id != GUILD_ID:
-        return None, "This bot works only in the configured server."
-
-    cat = category_object(guild)
-    staff_role = staff_role_object(guild)
-    if not cat or not staff_role:
-        return None, "Ticket system not configured (category or staff role missing)."
-
-    # Prevent duplicate ticket if exists in cfg
-    if str(user.id) in cfg.get("tickets", {}):
-        ch_id = cfg["tickets"][str(user.id)]
-        ch = guild.get_channel(ch_id)
-        return ch, "You already have an open ticket."
-
-    # Create channel
-    safe_name = f"ticket-{user.name}".replace(" ", "-")[:90]
-    overwrites = {
-        guild.default_role: discord.PermissionOverwrite(view_channel=False),
-        staff_role: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
-        guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
-        user: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
-    }
-    channel = await cat.create_text_channel(name=safe_name, overwrites=overwrites, topic=str(user.id))
-
-    # Save mapping
-    cfg.setdefault("tickets", {})[str(user.id)] = channel.id
-    save_config(cfg)
-
-    # Announce in channel and log
-    await channel.send(f"{staff_role.mention} 📬 New ticket opened by {user.mention} (via {opened_via})")
-    embed = discord.Embed(title="Ticket Opened", color=discord.Color.green(), timestamp=datetime.datetime.utcnow())
-    embed.add_field(name="User", value=f"{user} ({user.id})", inline=False)
-    embed.add_field(name="Channel", value=channel.mention, inline=False)
-    embed.add_field(name="Opened via", value=opened_via, inline=True)
-    await send_log_embed(guild, embed)
-
-    # Forward first message if provided
-    if first_message:
+        await interaction.response.send_message("📩 Check your DMs — starting ModMail.", ephemeral=True)
         try:
-            # build embed + attachments
-            emb = make_user_embed_for_ticket(user, first_message.content or "")
-            files = []
-            for a in first_message.attachments:
-                try:
-                    files.append(await a.to_file())
-                except Exception:
-                    pass
-            if files:
-                await channel.send(embed=emb, files=files)
-            else:
-                await channel.send(embed=emb)
-        except Exception as e:
-            print("Error forwarding first message:", e)
+            await start_dm_countdown_then_open(interaction.user, interaction.guild, source="panel")
+            start_cooldown(interaction.guild.id, interaction.user.id)
+        except discord.Forbidden:
+            await interaction.followup.send("❗ I can't DM you. Please enable DMs and try again.", ephemeral=True)
 
-    # DM user that ticket created
-    try:
-        await user.send(f"✅ Your ticket has been opened: {channel.mention}. Staff will respond here or in DMs.")
-    except Exception:
-        pass
+# ============ COUNTDOWN DM FLOW ============
+async def start_dm_countdown_then_open(user: discord.User, guild: discord.Guild, source: str, first_message: Optional[discord.Message] = None):
+    """Show a single DM embed that live-updates from 15->0, then auto-create the ticket."""
+    title = "Creating Your Support Ticket"
+    desc = "Your ticket will be opened automatically once the countdown finishes."
 
-    return channel, None
+    # send initial
+    seconds = DM_COUNTDOWN_SECONDS
+    embed = discord.Embed(title=title, description=f"{desc}\n\n**Starting in:** `{seconds}s`", color=discord.Color.green())
+    embed.set_footer(text=f"Server: {guild.name}")
+    msg = await user.send(embed=embed)
 
-# ----------------- TRANSCRIPT + CLOSE -----------------
-async def close_ticket(channel: discord.TextChannel, closed_by: discord.Member):
-    # find user id from topic or cfg mapping
-    user_id = None
-    # first check topic
-    try:
-        if channel.topic and channel.topic.isdigit():
-            user_id = channel.topic
-    except:
-        user_id = None
-
-    # fallback to cfg
-    if not user_id:
-        for uid, cid in cfg.get("tickets", {}).items():
-            if cid == channel.id:
-                user_id = uid
-                break
-
-    # create transcript and send to log
-    guild = channel.guild
-    transcript_path = None
-    try:
-        transcript_path = await create_transcript(channel)
-    except Exception as e:
-        print("Transcript creation failed:", e)
-
-    embed = discord.Embed(title="Ticket Closed", color=discord.Color.red(), timestamp=datetime.datetime.utcnow())
-    embed.add_field(name="Channel", value=channel.name, inline=True)
-    embed.add_field(name="Closed by", value=str(closed_by), inline=True)
-    if user_id:
+    # live update every second
+    for s in range(seconds - 1, -1, -1):
+        await asyncio.sleep(1)
+        embed.description = f"{desc}\n\n**Opening in:** `{s}s`"
         try:
-            user = await bot.fetch_user(int(user_id))
-            embed.add_field(name="User", value=f"{user} ({user_id})", inline=True)
-            # DM user
-            try:
-                await user.send("✅ Your ticket has been closed by staff. A transcript was posted to logs.")
-            except:
-                pass
-        except Exception:
-            embed.add_field(name="User ID", value=user_id, inline=True)
-
-    # send to log
-    await send_log_embed(guild, embed, file_path=transcript_path if transcript_path else None)
-
-    # cleanup mapping
-    if user_id and str(user_id) in cfg.get("tickets", {}):
-        cfg["tickets"].pop(str(user_id), None)
-        save_config(cfg)
-
-    # delete channel
-    try:
-        await channel.delete()
-    except Exception:
-        pass
-
-    # remove transcript file
-    if transcript_path:
-        try:
-            os.remove(transcript_path)
+            await msg.edit(embed=embed)
         except:
             pass
 
-# ----------------- COMMANDS -----------------
-# owner-only check for app_commands
-def owner_only():
-    def predicate(interaction: discord.Interaction):
-        return interaction.user.id == OWNER_ID
-    return app_commands.check(predicate)
+    # create ticket and forward first message, if any
+    ch, err = await create_ticket(guild, user, opened_via=source)
+    if err:
+        try: await user.send(f"⚠️ {err}")
+        except: pass
+        return
 
-@tree.command(name="set_category", description="Owner: set ticket category", guild=discord.Object(id=GUILD_ID))
-@owner_only()
-async def cmd_set_category(interaction: discord.Interaction, category: discord.CategoryChannel):
-    await interaction.response.defer(thinking=True, ephemeral=True)
-    cfg["category_id"] = category.id
-    save_config(cfg)
-    await interaction.followup.send(f"✅ Category set to **{category.name}**", ephemeral=True)
+    try:
+        await user.send("✅ Ticket created. Please reply here — staff will see your messages.")
+    except: pass
 
-@tree.command(name="set_staff_role", description="Owner: set staff role", guild=discord.Object(id=GUILD_ID))
-@owner_only()
-async def cmd_set_staff_role(interaction: discord.Interaction, role: discord.Role):
-    await interaction.response.defer(thinking=True, ephemeral=True)
-    cfg["staff_role_id"] = role.id
-    save_config(cfg)
-    await interaction.followup.send(f"✅ Staff role set to {role.mention}", ephemeral=True)
+    # forward the first message (for DM flow) if provided
+    if first_message:
+        files = []
+        for a in first_message.attachments:
+            try: files.append(await a.to_file())
+            except: pass
+        emb = user_embed(user, first_message.content or "")
+        try:
+            if files: await ch.send(embed=emb, files=files)
+            else:     await ch.send(embed=emb)
+        except: pass
 
-@tree.command(name="set_log_channel", description="Owner: set log channel", guild=discord.Object(id=GUILD_ID))
-@owner_only()
-async def cmd_set_log_channel(interaction: discord.Interaction, channel: discord.TextChannel):
-    await interaction.response.defer(thinking=True, ephemeral=True)
-    cfg["log_channel_id"] = channel.id
-    save_config(cfg)
-    await interaction.followup.send(f"✅ Log channel set to {channel.mention}", ephemeral=True)
+# ============ COMMANDS ============
+@bot.event
+async def on_ready():
+    try:
+        await tree.sync()  # global sync (works across servers)
+    except Exception as e:
+        print("Sync error:", e)
+    print(f"✅ Logged in as {bot.user} ({bot.user.id})")
 
-@tree.command(name="settings", description="Show current modmail settings", guild=discord.Object(id=GUILD_ID))
-async def cmd_settings(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True)
-    g = interaction.guild
-    cat = g.get_channel(cfg.get("category_id")) if cfg.get("category_id") else None
-    staff = g.get_role(cfg.get("staff_role_id")) if cfg.get("staff_role_id") else None
-    log = g.get_channel(cfg.get("log_channel_id")) if cfg.get("log_channel_id") else None
+# --- Setup commands (Admin or Owner) ---
+@tree.command(name="set_category", description="Set the ticket category (Admin/Owner)")
+async def set_category_cmd(inter: discord.Interaction, category_chan: discord.CategoryChannel):
+    if not is_admin_or_owner(inter):
+        return await inter.response.send_message("❌ Admin only.", ephemeral=True)
+    gcfg(inter.guild)["category_id"] = category_chan.id
+    save_cfg(cfg)
+    await inter.response.send_message(f"✅ Category set to **{category_chan.name}**", ephemeral=True)
 
+@tree.command(name="set_staff_role", description="Set the staff role (Admin/Owner)")
+async def set_staff_role_cmd(inter: discord.Interaction, role: discord.Role):
+    if not is_admin_or_owner(inter):
+        return await inter.response.send_message("❌ Admin only.", ephemeral=True)
+    gcfg(inter.guild)["staff_role_id"] = role.id
+    save_cfg(cfg)
+    await inter.response.send_message(f"✅ Staff role set to {role.mention}", ephemeral=True)
+
+@tree.command(name="set_log_channel", description="Set the log channel (Admin/Owner)")
+async def set_log_channel_cmd(inter: discord.Interaction, channel: discord.TextChannel):
+    if not is_admin_or_owner(inter):
+        return await inter.response.send_message("❌ Admin only.", ephemeral=True)
+    gcfg(inter.guild)["log_channel_id"] = channel.id
+    save_cfg(cfg)
+    await inter.response.send_message(f"✅ Log channel set to {channel.mention}", ephemeral=True)
+
+@tree.command(name="settings", description="View current ModMail settings")
+async def settings_cmd(inter: discord.Interaction):
+    gc = gcfg(inter.guild)
+    cat = inter.guild.get_channel(gc.get("category_id")) if gc.get("category_id") else None
+    sr = inter.guild.get_role(gc.get("staff_role_id")) if gc.get("staff_role_id") else None
+    log = inter.guild.get_channel(gc.get("log_channel_id")) if gc.get("log_channel_id") else None
     e = discord.Embed(title="ModMail Settings", color=discord.Color.blurple())
     e.add_field(name="Category", value=cat.name if cat else "❌ Not set", inline=False)
-    e.add_field(name="Staff Role", value=staff.name if staff else "❌ Not set", inline=False)
+    e.add_field(name="Staff Role", value=sr.mention if sr else "❌ Not set", inline=False)
     e.add_field(name="Log Channel", value=log.mention if log else "❌ Not set", inline=False)
-    await interaction.followup.send(embed=e, ephemeral=True)
+    await inter.response.send_message(embed=e, ephemeral=True)
 
-@tree.command(name="send_panel", description="Send the Create Ticket panel (Staff+Owner)", guild=discord.Object(id=GUILD_ID))
-async def cmd_send_panel(interaction: discord.Interaction):
-    # only staff or owner can send panel
-    if not (is_owner_user(interaction.user) or user_has_staff_role(interaction.user)):
-        return await interaction.response.send_message("❌ You don't have permission to send the panel.", ephemeral=True)
-    await interaction.response.defer(ephemeral=True)
-    embed = discord.Embed(title="🎟 Need Help?", description="Click the button below to open a private ticket with staff.", color=discord.Color.green())
-    view = PanelView()
-    await interaction.channel.send(embed=embed, view=view)
-    await interaction.followup.send("✅ Panel posted.", ephemeral=True)
+@tree.command(name="send_panel", description="Send a Create Ticket panel (Staff/Admin/Owner)")
+async def send_panel_cmd(inter: discord.Interaction):
+    if not has_staff(inter.user):
+        return await inter.response.send_message("❌ Staff/Admin only.", ephemeral=True)
+    if not category(inter.guild) or not staff_role(inter.guild):
+        return await inter.response.send_message("⚠️ Configure category & staff role first.", ephemeral=True)
+    e = discord.Embed(
+        title="📩 Support Panel",
+        description="Need help? Click the button below to start a private ModMail ticket.\nYou will chat **via DM** only.",
+        color=discord.Color.green()
+    )
+    await inter.channel.send(embed=e, view=PanelView())
+    await inter.response.send_message("✅ Panel sent.", ephemeral=True)
 
-@tree.command(name="modmail", description="Open a ModMail ticket (5m cooldown)", guild=discord.Object(id=GUILD_ID))
-async def cmd_modmail(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True)
-    # cooldown
-    now = asyncio.get_event_loop().time()
-    last = _modmail_timestamps.get(interaction.user.id, 0)
-    if now - last < MODMAIL_COOLDOWN:
-        remain = int(MODMAIL_COOLDOWN - (now - last))
-        return await interaction.followup.send(f"⏳ You must wait {remain}s before creating another ticket.", ephemeral=True)
-    _modmail_timestamps[interaction.user.id] = now
+@tree.command(name="modmail", description="Open a ModMail ticket (DM-only, live countdown)")
+async def modmail_cmd(inter: discord.Interaction):
+    if not category(inter.guild) or not staff_role(inter.guild):
+        return await inter.response.send_message("⚠️ Ticket system not configured.", ephemeral=True)
 
-    ch, err = await create_ticket_for_user(interaction.user, interaction.guild, opened_via="slash")
-    if err:
-        return await interaction.followup.send(err, ephemeral=True)
-    await interaction.followup.send(f"✅ Ticket created: {ch.mention}", ephemeral=True)
+    left = in_cooldown(inter.guild.id, inter.user.id)
+    if left > 0:
+        return await inter.response.send_message(f"⏳ Please wait **{left}s** before opening another ticket.", ephemeral=True)
 
-@tree.command(name="close", description="Close this ticket (staff/owner)", guild=discord.Object(id=GUILD_ID))
-async def cmd_close(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True)
-    # only staff or owner
-    if not (is_owner_user(interaction.user) or user_has_staff_role(interaction.user)):
-        return await interaction.followup.send("❌ You don't have permission to close tickets.", ephemeral=True)
-
-    # validate channel
-    if not interaction.channel or not isinstance(interaction.channel, discord.TextChannel):
-        return await interaction.followup.send("⚠️ This command must be used in a ticket channel.", ephemeral=True)
-
-    # ensure it's a managed ticket
-    if str(interaction.channel.id) not in map(str, cfg.get("tickets", {}).values()):
-        return await interaction.followup.send("❌ This is not a managed ticket channel.", ephemeral=True)
-
-    # proceed to close
-    await interaction.followup.send("🗂 Closing ticket and saving transcript...", ephemeral=True)
-    await close_ticket(interaction.channel, interaction.user)
-
-@tree.command(name="refresh", description="Refresh slash commands (owner only)", guild=discord.Object(id=GUILD_ID))
-@owner_only()
-async def cmd_refresh(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True)
+    await inter.response.send_message("📩 Check your DMs — starting ModMail.", ephemeral=True)
     try:
-        await bot.tree.sync(guild=discord.Object(id=GUILD_ID))
-        await bot.tree.sync()
-        await interaction.followup.send("✅ Commands synced (guild + global).", ephemeral=True)
-    except Exception as e:
-        await interaction.followup.send(f"⚠️ Sync failed: {e}", ephemeral=True)
+        await start_dm_countdown_then_open(inter.user, inter.guild, source="slash")
+        start_cooldown(inter.guild.id, inter.user.id)
+    except discord.Forbidden:
+        await inter.followup.send("❗ I can't DM you. Please enable DMs and try again.", ephemeral=True)
 
-# ----------------- EVENTS: DMs & Ticket message forwarding -----------------
+@tree.command(name="close", description="Close this ticket (Staff/Admin/Owner)")
+async def close_cmd(inter: discord.Interaction):
+    if not has_staff(inter.user):
+        return await inter.response.send_message("❌ Staff/Admin only.", ephemeral=True)
+
+    gc = gcfg(inter.guild)
+    if str(inter.channel.id) not in map(str, gc["tickets"].values()):
+        return await inter.response.send_message("❌ This is not a ModMail ticket channel.", ephemeral=True)
+
+    await inter.response.send_message("🗂 Closing ticket and saving transcript…", ephemeral=True)
+    await close_ticket(inter.guild, inter.channel, inter.user)
+
+@tree.command(name="refresh", description="Refresh slash commands (Admin/Owner)")
+async def refresh_cmd(inter: discord.Interaction):
+    if not is_admin_or_owner(inter):
+        return await inter.response.send_message("❌ Admin only.", ephemeral=True)
+    await inter.response.defer(ephemeral=True)
+    try:
+        await tree.sync()
+        await inter.followup.send("✅ Commands refreshed.", ephemeral=True)
+    except Exception as e:
+        await inter.followup.send(f"⚠️ Sync failed: {e}", ephemeral=True)
+
+# ============ MESSAGE FORWARDING ============
 @bot.event
 async def on_message(message: discord.Message):
-    # ignore bots
     if message.author.bot:
         return
 
-    # If DM to bot
+    # 1) DMs -> forward to a configured server ticket (or start countdown)
     if isinstance(message.channel, discord.DMChannel):
-        user = message.author
-        guild = bot.get_guild(GUILD_ID)
-        if not guild:
+        # If user already has an open ticket in any configured guild, forward there.
+        target_guild = None
+        target_channel = None
+        for g in bot.guilds:
+            gc = gcfg(g)
+            if str(message.author.id) in gc["tickets"]:
+                ch = g.get_channel(gc["tickets"][str(message.author.id)])
+                if ch:
+                    target_guild = g; target_channel = ch; break
+
+        if target_channel:
+            emb = user_embed(message.author, message.content or "")
+            files = []
+            for a in message.attachments:
+                try: files.append(await a.to_file())
+                except: pass
             try:
-                await user.send("⚠️ Bot is not connected to the configured server.")
-            except:
-                pass
+                if files: await target_channel.send(embed=emb, files=files)
+                else:     await target_channel.send(embed=emb)
+            except: pass
             return
 
-        # If user already has ticket, forward directly
-        if str(user.id) in cfg.get("tickets", {}):
-            ch_id = cfg["tickets"].get(str(user.id))
-            ch = guild.get_channel(ch_id)
-            if ch:
-                emb = make_user_embed_for_ticket(user, message.content or "")
-                files = []
-                for a in message.attachments:
-                    try:
-                        files.append(await a.to_file())
-                    except:
-                        pass
-                try:
-                    if files:
-                        await ch.send(embed=emb, files=files)
-                    else:
-                        await ch.send(embed=emb)
-                except Exception:
-                    pass
+        # No open ticket -> pick a configured guild and start countdown, then create
+        g = await pick_target_guild_for_dm(message.author)
+        if not g:
+            try: await message.author.send("⚠️ No server is configured for ModMail yet. Please try again later.")
+            except: pass
             return
 
-        # Otherwise ask for confirmation with buttons
+        # Cooldown per (guild, user)
+        left = in_cooldown(g.id, message.author.id)
+        if left > 0:
+            try: await message.author.send(f"⏳ Please wait **{left}s** before opening another ticket.")
+            except: pass
+            return
+
+        # Live countdown; auto-creates and forwards THIS first message
         try:
-            preview = make_user_embed_for_ticket(user, message.content or "")
-            view = DMConfirmView(user, message)
-            try:
-                await user.send("Do you want to create a support ticket? (15s)", embed=preview, view=view)
-            except Exception:
-                # can't DM user, abort
-                return
-            # wait until view stops (user clicked or timeout)
-            await view.wait()
-            if view.result != "confirm":
-                try:
-                    await user.send("❌ Ticket creation cancelled.")
-                except:
-                    pass
-                return
-            # create ticket and forward original message
-            ch, err = await create_ticket_for_user(user, guild, opened_via="DM", first_message=message)
-            if err:
-                try:
-                    await user.send(f"⚠️ {err}")
-                except:
-                    pass
-                return
-        except Exception as e:
-            print("Error handling DM:", e)
-            return
+            await start_dm_countdown_then_open(message.author, g, source="DM", first_message=message)
+            start_cooldown(g.id, message.author.id)
+        except discord.Forbidden:
+            # Can't DM (shouldn't happen since we're already in DM), ignore
+            pass
 
         return
 
-    # If message in a guild (possible ticket reply)
-    if message.guild and message.guild.id == GUILD_ID:
-        # If message occurs in a ticket channel managed by cfg, forward to user
-        for uid, cid in list(cfg.get("tickets", {}).items()):
-            if cid == message.channel.id:
-                # only forward if author is staff or owner (to avoid echoing user messages)
-                try:
-                    member = message.author
-                    if not (is_owner_user(member) or user_has_staff_role(member)):
-                        # not staff, don't forward
-                        break
-                except:
-                    break
+    # 2) Guild messages in ticket channels by staff -> forward to user's DM
+    if message.guild:
+        gc = gcfg(message.guild)
+        # if message channel is a ticket channel we manage
+        if str(message.channel.id) in map(str, gc["tickets"].values()):
+            # Only forward staff/admin/owner responses to user
+            if not has_staff(message.author):
+                return
 
-                # forward to user
-                try:
-                    user = await bot.fetch_user(int(uid))
-                    emb = make_staff_embed_for_user(message.author, message.content or "")
-                    files = []
-                    for a in message.attachments:
-                        try:
-                            files.append(await a.to_file())
-                        except:
-                            pass
-                    if files:
-                        await user.send(embed=emb, files=files)
-                    else:
-                        await user.send(embed=emb)
-                    # log forwarding
-                    log_embed = discord.Embed(title="Message forwarded to user", color=discord.Color.light_grey(), timestamp=datetime.datetime.utcnow())
-                    log_embed.add_field(name="From (staff)", value=str(message.author), inline=True)
-                    log_embed.add_field(name="To (user)", value=uid, inline=True)
-                    log_embed.add_field(name="Channel", value=message.channel.mention, inline=True)
-                    await send_log_embed(message.guild, log_embed)
-                except Exception:
-                    try:
-                        await message.channel.send("⚠️ Could not DM the user.")
-                    except:
-                        pass
-                break
+            # find user id
+            uid = None
+            for k, v in gc["tickets"].items():
+                if v == message.channel.id:
+                    uid = k; break
+            if not uid: return
 
-    # finally process commands as usual
+            try:
+                user = await bot.fetch_user(int(uid))
+            except:
+                return
+
+            emb = staff_embed(message.author, message.content or "")
+            files = []
+            for a in message.attachments:
+                try: files.append(await a.to_file())
+                except: pass
+            try:
+                if files: await user.send(embed=emb, files=files)
+                else:     await user.send(embed=emb)
+            except:  # DM closed
+                try:
+                    await message.channel.send("⚠️ Could not DM the user (DMs are closed).")
+                except: pass
+
     await bot.process_commands(message)
 
-# ----------------- READY -----------------
-@bot.event
-async def on_ready():
-    print(f"✅ Logged in as {bot.user} (id: {bot.user.id})")
-    # sync commands for the guild only (faster)
-    try:
-        await bot.tree.sync(guild=discord.Object(id=GUILD_ID))
-    except Exception as e:
-        print("Sync error:", e)
-
-# ----------------- RUN -----------------
-if TOKEN is None:
-    print("ERROR: set DISCORD_BOT_TOKEN environment variable")
+# ============ RUN ============
+if not TOKEN:
+    print("ERROR: set DISCORD_BOT_TOKEN env var")
 else:
     bot.run(TOKEN)
