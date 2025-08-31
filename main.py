@@ -11,7 +11,7 @@ from typing import Optional, Tuple
 OWNER_ID = 1319292111325106296                # your ID (owner)
 TOKEN = os.getenv("DISCORD_BOT_TOKEN")        # set this in environment
 CONFIG_FILE = "config.json"
-FOOTER_IMAGE_SOURCE = "/mnt/data/DEBEC8AF-40C2-421C-8F41-B606AB6A6072.jpeg"  # developer-uploaded image path
+FOOTER_IMAGE_SOURCE = "https://i.postimg.cc/rp5b7Jkn/IMG-6152.jpg"  # developer-uploaded image path
 FOOTER_ATTACHMENT_NAME = "footer.png"
 FOOTER_TEXT = "@ u4_straight1"
 
