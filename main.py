@@ -22,7 +22,7 @@ def home():
     return "Bot is running!"
 
 def run():
-    port = int(os.environ.get("PORT", 8080))  # use Render's PORT if available
+    port = int(os.environ.get("PORT", 8080))  # Render sets PORT automatically
     app.run(host='0.0.0.0', port=port)
 
 def keep_alive():
