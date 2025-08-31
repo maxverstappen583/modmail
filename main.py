@@ -7,21 +7,21 @@ from flask import Flask
 from threading import Thread
 from typing import Optional, Tuple
 
-# ---------------- CONFIG - EDIT THESE ----------------
+# ---------------- CONFIG ----------------
 OWNER_ID = 1319292111325106296
-GUILD_ID = 1364371104755613837   # <<--- REPLACE this with your server ID (int)
-TOKEN = os.getenv("DISCORD_BOT_TOKEN")  # set in env
+GUILD_ID = 1364371104755613837   # <<< your server ID (locked to this guild)
+TOKEN = os.getenv("DISCORD_BOT_TOKEN")  # set this in your host env
 
 CONFIG_FILE = "config.json"
-FOOTER_IMAGE_PATH = "https://i.postimg.cc/rp5b7Jkn/IMG-6152.jpg"  # keep as-is if file exists there
+FOOTER_IMAGE_PATH = "/mnt/data/DEBEC8AF-40C2-421C-8F41-B606AB6A6072.jpeg"
 FOOTER_ATTACHMENT_NAME = "footer.png"
 FOOTER_TEXT = "@ u4_straight1"
 
 DM_COUNTDOWN = 15  # seconds before creating ticket
-# ----------------------------------------------------
 
 # ---------------- FLASK KEEP-ALIVE ----------------
 app = Flask(__name__)
+
 @app.route("/")
 def home():
     return "ModMail bot is alive"
@@ -86,7 +86,7 @@ def in_cooldown(guild_id: int, user_id: int) -> int:
 def start_cooldown(guild_id: int, user_id: int):
     _last_open[(guild_id, user_id)] = asyncio.get_event_loop().time()
 
-# ---------------- FOOTER FILE HELPERS ----------------
+# ---------------- FOOTER HELPERS ----------------
 def attach_footer_send_kwargs() -> Tuple[Optional[discord.File], Optional[str]]:
     """Return (discord.File or None, icon_url or None) for footer attachment."""
     if os.path.exists(FOOTER_IMAGE_PATH):
@@ -315,6 +315,7 @@ class PanelView(ui.View):
         if left > 0:
             return await interaction.response.send_message(f"⏳ Please wait {left}s before opening another ticket.", ephemeral=True)
 
+        # MUST respond or defer
         await interaction.response.send_message("📩 Check your DMs — starting countdown.", ephemeral=True)
         try:
             await dm_countdown_then_create(interaction.user, interaction.guild, source="panel")
@@ -326,48 +327,55 @@ def admin_check(interaction: discord.Interaction):
     m = interaction.user if isinstance(interaction.user, discord.Member) else None
     return bool(m and m.guild_permissions.administrator) or interaction.user.id == OWNER_ID
 
+# We always defer when we will do longer work; all commands respond or defer.
+
 @tree.command(name="set_category", description="Set the ticket category (Admin required)", guild=discord.Object(id=GUILD_ID))
 @app_commands.describe(category="Category where tickets will be created")
 async def cmd_set_category(interaction: discord.Interaction, category: discord.CategoryChannel):
     if not admin_check(interaction):
         return await interaction.response.send_message("❌ You don't have permission.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
     cfg_g = ensure_guild_cfg(interaction.guild.id)
     cfg_g["category_id"] = category.id
     save_cfg(CFG)
-    await interaction.response.send_message(f"✅ Category set to **{category.name}**", ephemeral=True)
+    await interaction.followup.send(f"✅ Category set to **{category.name}**", ephemeral=True)
 
 @tree.command(name="set_staffrole", description="Set the staff role (Admin required)", guild=discord.Object(id=GUILD_ID))
 @app_commands.describe(role="Role to set as staff")
 async def cmd_set_staffrole(interaction: discord.Interaction, role: discord.Role):
     if not admin_check(interaction):
         return await interaction.response.send_message("❌ You don't have permission.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
     cfg_g = ensure_guild_cfg(interaction.guild.id)
     cfg_g["staff_role_id"] = role.id
     save_cfg(CFG)
-    await interaction.response.send_message(f"✅ Staff role set to {role.mention}", ephemeral=True)
+    await interaction.followup.send(f"✅ Staff role set to {role.mention}", ephemeral=True)
 
 @tree.command(name="set_logchannel", description="Set log channel for tickets (Admin required)", guild=discord.Object(id=GUILD_ID))
 @app_commands.describe(channel="Channel to post ticket logs/transcripts")
 async def cmd_set_logchannel(interaction: discord.Interaction, channel: discord.TextChannel):
     if not admin_check(interaction):
         return await interaction.response.send_message("❌ You don't have permission.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
     cfg_g = ensure_guild_cfg(interaction.guild.id)
     cfg_g["log_channel_id"] = channel.id
     save_cfg(CFG)
-    await interaction.response.send_message(f"✅ Log channel set to {channel.mention}", ephemeral=True)
+    await interaction.followup.send(f"✅ Log channel set to {channel.mention}", ephemeral=True)
 
 @tree.command(name="set_cooldown", description="Set per-guild ticket creation cooldown in seconds (Admin)", guild=discord.Object(id=GUILD_ID))
 @app_commands.describe(seconds="Cooldown in seconds")
 async def cmd_set_cooldown(interaction: discord.Interaction, seconds: int):
     if not admin_check(interaction):
         return await interaction.response.send_message("❌ You don't have permission.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
     cfg_g = ensure_guild_cfg(interaction.guild.id)
     cfg_g["cooldown"] = max(0, int(seconds))
     save_cfg(CFG)
-    await interaction.response.send_message(f"✅ Cooldown set to {cfg_g['cooldown']} seconds", ephemeral=True)
+    await interaction.followup.send(f"✅ Cooldown set to {cfg_g['cooldown']} seconds", ephemeral=True)
 
 @tree.command(name="settings", description="View ModMail settings (Admin/Staff)", guild=discord.Object(id=GUILD_ID))
 async def cmd_settings(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
     cfg_g = ensure_guild_cfg(interaction.guild.id)
     cat = interaction.guild.get_channel(cfg_g.get("category_id")) if cfg_g.get("category_id") else None
     sr = interaction.guild.get_role(cfg_g.get("staff_role_id")) if cfg_g.get("staff_role_id") else None
@@ -380,17 +388,18 @@ async def cmd_settings(interaction: discord.Interaction):
     file_obj, icon_url = attach_footer_send_kwargs()
     set_footer_on_embed(e, icon_url)
     if file_obj:
-        await interaction.response.send_message(embed=e, file=file_obj, ephemeral=True)
+        await interaction.followup.send(embed=e, file=file_obj, ephemeral=True)
     else:
-        await interaction.response.send_message(embed=e, ephemeral=True)
+        await interaction.followup.send(embed=e, ephemeral=True)
 
 @tree.command(name="send_panel", description="Send a Create Ticket panel (Admin only)", guild=discord.Object(id=GUILD_ID))
 async def cmd_send_panel(interaction: discord.Interaction):
     if not admin_check(interaction):
-        return await interaction.response.send_message("❌ You don't have permission.", ephemeral=True)
+        return await interaction.response.send_message("❌ You don't have permission to use this command.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
     cfg_g = ensure_guild_cfg(interaction.guild.id)
     if not cfg_g.get("category_id") or not cfg_g.get("staff_role_id"):
-        return await interaction.response.send_message("⚠️ Configure category & staff role first.", ephemeral=True)
+        return await interaction.followup.send("⚠️ Configure category & staff role first.", ephemeral=True)
     e = discord.Embed(title="📩 Support Panel", description="Click the button below to open a private ModMail ticket. You will chat via DM only.", color=discord.Color.green())
     file_obj, icon_url = attach_footer_send_kwargs()
     set_footer_on_embed(e, icon_url)
@@ -399,17 +408,18 @@ async def cmd_send_panel(interaction: discord.Interaction):
         await interaction.channel.send(embed=e, view=view, file=file_obj)
     else:
         await interaction.channel.send(embed=e, view=view)
-    await interaction.response.send_message("✅ Panel sent.", ephemeral=True)
+    await interaction.followup.send("✅ Panel sent.", ephemeral=True)
 
 @tree.command(name="modmail", description="Open a ModMail ticket (starts DM countdown)", guild=discord.Object(id=GUILD_ID))
 async def cmd_modmail(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
     cfg_g = ensure_guild_cfg(interaction.guild.id)
     if not cfg_g.get("category_id") or not cfg_g.get("staff_role_id"):
-        return await interaction.response.send_message("⚠️ Ticket system not configured.", ephemeral=True)
+        return await interaction.followup.send("⚠️ Ticket system not configured.", ephemeral=True)
     left = in_cooldown(interaction.guild.id, interaction.user.id)
     if left > 0:
-        return await interaction.response.send_message(f"⏳ Please wait {left}s before opening another ticket.", ephemeral=True)
-    await interaction.response.send_message("📩 Check your DMs — starting the ticket countdown.", ephemeral=True)
+        return await interaction.followup.send(f"⏳ Please wait {left}s before opening another ticket.", ephemeral=True)
+    await interaction.followup.send("📩 Check your DMs — starting the ticket countdown.", ephemeral=True)
     try:
         await dm_countdown_then_create(interaction.user, interaction.guild, source="slash")
     except discord.Forbidden:
@@ -417,25 +427,29 @@ async def cmd_modmail(interaction: discord.Interaction):
 
 @tree.command(name="close", description="Close this ticket (staff/admin)", guild=discord.Object(id=GUILD_ID))
 async def cmd_close(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
     member = interaction.user if isinstance(interaction.user, discord.Member) else None
     cfg_g = ensure_guild_cfg(interaction.guild.id)
     staff_role = interaction.guild.get_role(cfg_g.get("staff_role_id")) if cfg_g.get("staff_role_id") else None
     if not (member and (member.guild_permissions.administrator or (staff_role and staff_role in member.roles))):
-        return await interaction.response.send_message("❌ You don't have permission to close tickets.", ephemeral=True)
+        return await interaction.followup.send("❌ You don't have permission to close tickets.", ephemeral=True)
     if str(interaction.channel.id) not in map(str, cfg_g.get("tickets", {}).values()):
-        return await interaction.response.send_message("⚠️ This is not a ModMail ticket channel.", ephemeral=True)
-    await interaction.response.send_message("🗂 Closing ticket and saving transcript...", ephemeral=True)
+        return await interaction.followup.send("⚠️ This is not a ModMail ticket channel.", ephemeral=True)
+    await interaction.followup.send("🗂 Closing ticket and saving transcript...", ephemeral=True)
     await close_ticket(interaction.channel, interaction.user)
 
-@tree.command(name="refresh", description="Admin: refresh commands for this guild (clears old commands & resync)", guild=discord.Object(id=GUILD_ID))
+@tree.command(name="refresh", description="Admin: refresh commands for this guild (clears old commands & re-sync)", guild=discord.Object(id=GUILD_ID))
 async def cmd_refresh(interaction: discord.Interaction):
     if not admin_check(interaction):
         return await interaction.response.send_message("❌ You don't have permission.", ephemeral=True)
+    # MUST defer because this may take > 3s
     await interaction.response.defer(ephemeral=True)
     try:
-        # clear guild commands then sync current
+        # clear guild commands then sync current ones
         tree.clear_commands(guild=discord.Object(id=GUILD_ID))
         await tree.sync(guild=discord.Object(id=GUILD_ID))
+        # also sync global to be safe
+        await tree.sync()
         await interaction.followup.send("✅ Guild commands refreshed (old guild commands cleared).", ephemeral=True)
     except Exception as e:
         await interaction.followup.send(f"⚠️ Refresh failed: {e}", ephemeral=True)
@@ -561,7 +575,6 @@ async def on_message(message: discord.Message):
 async def on_ready():
     print(f"Bot ready: {bot.user} (id: {bot.user.id})")
     try:
-        # sync for the configured guild for faster updates
         await tree.sync(guild=discord.Object(id=GUILD_ID))
         print(f"Commands synced for guild {GUILD_ID}")
     except Exception as e:
