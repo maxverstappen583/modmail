@@ -8,12 +8,9 @@ from discord.ext import commands
 from discord import app_commands, ui
 import asyncio
 import json
-import os
-import tempfile
-import datetime
-import os
 from flask import Flask
 from threading import Thread
+import os
 
 app = Flask('')
 
@@ -22,12 +19,16 @@ def home():
     return "Bot is running!"
 
 def run():
-    port = int(os.environ.get("PORT", 8080))  # Render sets PORT automatically
+    port = int(os.environ.get("PORT", 8080))  # use Render's PORT env
     app.run(host='0.0.0.0', port=port)
 
 def keep_alive():
     t = Thread(target=run)
+    t.daemon = True
     t.start()
+
+# Call this **before starting the bot**
+keep_alive()
 # ========== CONFIG ==========
 TOKEN = os.getenv("DISCORD_BOT_TOKEN")  # <-- replace with your bot token
 GUILD_ID = 1364371104755613837  # locked to your server
