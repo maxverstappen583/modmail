@@ -1,6 +1,6 @@
 import discord
 from discord.ext import commands
-from discord import ui, ButtonStyle
+from discord import ui, ButtonStyle, app_commands
 import openai
 import os
 import json
@@ -13,6 +13,8 @@ import asyncio
 load_dotenv()
 BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+GUILD_ID = int(os.getenv("GUILD_ID", 0))
+OTHER_GUILD_RESPONSE = os.getenv("OTHER_GUILD_RESPONSE", "Sorry, this bot is only available in the official server!")
 openai.api_key = OPENAI_API_KEY
 
 # ===== FLASK =====
@@ -51,6 +53,27 @@ async def on_ready():
     print(f"{bot.user} is online and ready!")
     await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.watching, name="Mod Mail"))
 
+# ===== GUILD CHECK DECORATOR =====
+def guild_only():
+    async def predicate(ctx):
+        if ctx.guild is None:
+            return True
+        if ctx.guild.id != GUILD_ID:
+            await ctx.send(OTHER_GUILD_RESPONSE, ephemeral=True)
+            return False
+        return True
+    return commands.check(predicate)
+
+def guild_only_app():
+    async def check(interaction: discord.Interaction) -> bool:
+        if interaction.guild is None:
+            return True
+        if interaction.guild.id != GUILD_ID:
+            await interaction.response.send_message(OTHER_GUILD_RESPONSE, ephemeral=True)
+            return False
+        return True
+    return app_commands.check(check)
+
 # ===== EMBED HELPER =====
 def get_embed_color(member: discord.Member):
     for role in reversed(member.roles):
@@ -85,12 +108,10 @@ async def summarize_problem(messages):
 async def create_ticket_channel(guild: discord.Guild, user: discord.User, settings):
     category_id = int(settings.get("ticket_category", 0))
     category = discord.utils.get(guild.categories, id=category_id)
-
     overwrites = {
         guild.default_role: discord.PermissionOverwrite(read_messages=False),
         guild.get_role(int(settings.get("staff_role", 0))): discord.PermissionOverwrite(read_messages=True, send_messages=True)
     }
-
     channel = await guild.create_text_channel(
         name=f"ticket-{user.name}",
         category=category,
@@ -102,11 +123,9 @@ async def mark_ticket_solved(channel: discord.TextChannel, user: discord.User):
     overwrites = channel.overwrites
     overwrites[user] = discord.PermissionOverwrite(read_messages=True, send_messages=False)
     await channel.edit(overwrites=overwrites)
-
     messages = await channel.history(limit=50, oldest_first=True).flatten()
     user_messages = [msg.content for msg in messages if msg.author.id == user.id]
     problem_text = await summarize_problem(user_messages) if user_messages else "No messages detected."
-
     embed = discord.Embed(
         title="Ticket Resolved",
         description=f"**Problem detected automatically:**\n{problem_text}",
@@ -155,44 +174,20 @@ class SolvedButton(ui.View):
         await interaction.message.edit(view=None)
         await interaction.followup.send("Ticket locked and ready to be closed.", ephemeral=True)
 
-class TicketConfirm(ui.View):
-    def __init__(self, user, ctx):
-        super().__init__(timeout=60)
-        self.user = user
-        self.ctx = ctx
-        self.value = None
-
-    @ui.button(label="✅ Confirm", style=ButtonStyle.green)
-    async def confirm(self, interaction: discord.Interaction, button: ui.Button):
-        await interaction.response.defer(ephemeral=True)
-        if interaction.user != self.user:
-            await interaction.followup.send("This is not for you.", ephemeral=True)
-            return
-        self.value = True
-        self.stop()
-        await interaction.followup.send("Ticket confirmed! Staff will now be notified.", ephemeral=True)
-
-    @ui.button(label="❎ Cancel", style=ButtonStyle.red)
-    async def cancel(self, interaction: discord.Interaction, button: ui.Button):
-        await interaction.response.defer(ephemeral=True)
-        if interaction.user != self.user:
-            await interaction.followup.send("This is not for you.", ephemeral=True)
-            return
-        self.value = False
-        self.stop()
-        await interaction.followup.send("Ticket creation canceled.", ephemeral=True)
-
 # ===== DM ↔ TICKET SYNC =====
 @bot.event
 async def on_message(message):
     if message.author.bot:
         return
+    if message.guild and message.guild.id != GUILD_ID:
+        await message.channel.send(OTHER_GUILD_RESPONSE)
+        return
 
     settings = load_settings()
-    guild = bot.guilds[0]
+    guild = bot.get_guild(GUILD_ID)
     active_tickets = settings.get("active_tickets", {})
 
-    # ===== User DMs =====
+    # User DM → Ticket
     if isinstance(message.channel, discord.DMChannel):
         if str(message.author.id) in active_tickets:
             channel = guild.get_channel(active_tickets[str(message.author.id)])
@@ -201,7 +196,6 @@ async def on_message(message):
             active_tickets[str(message.author.id)] = channel.id
             settings["active_tickets"] = active_tickets
             save_settings(settings)
-
             staff_role = guild.get_role(int(settings.get("staff_role", 0)))
             embed = discord.Embed(
                 title="New Ticket",
@@ -210,11 +204,10 @@ async def on_message(message):
             )
             embed.set_footer(text="@u4_straight1", icon_url="https://i.postimg.cc/rp5b7Jkn/IMG-6152.jpg")
             await channel.send(embed=embed, view=SolvedButton(channel, message.author))
-
         embed = create_embed(message.author, message.content, message.attachments, member_obj=message.author)
         await channel.send(embed=embed)
 
-    # ===== Staff messages in ticket channel =====
+    # Staff → User DM
     elif message.channel.name.startswith("ticket-") and not isinstance(message.channel, discord.DMChannel):
         for user_id, ch_id in active_tickets.items():
             if ch_id == message.channel.id:
@@ -222,7 +215,6 @@ async def on_message(message):
                 break
         else:
             return
-
         if user:
             content = f"**Staff Reply:** {message.content}" if message.content else ""
             if message.attachments:
@@ -233,7 +225,7 @@ async def on_message(message):
 
     await bot.process_commands(message)
 
-# ===== Typing indicator in staff ticket channel =====
+# ===== Typing indicator =====
 @bot.event
 async def on_typing(channel, user, when):
     if user.bot:
@@ -241,11 +233,72 @@ async def on_typing(channel, user, when):
     if isinstance(channel, discord.DMChannel):
         settings = load_settings()
         active_tickets = settings.get("active_tickets", {})
-        guild = bot.guilds[0]
         if str(user.id) in active_tickets:
-            ticket_channel = guild.get_channel(active_tickets[str(user.id)])
+            ticket_channel = bot.get_guild(GUILD_ID).get_channel(active_tickets[str(user.id)])
             if ticket_channel:
                 async with ticket_channel.typing():
                     await asyncio.sleep(2)
+
+# ===== COMMANDS =====
+@bot.command()
+@guild_only()
+async def refresh(ctx):
+    await ctx.send("Panel refreshed ✅")
+
+@bot.tree.command(name="send_panel")
+@guild_only_app()
+async def send_panel(interaction: discord.Interaction):
+    await interaction.response.send_message("Panel sent ✅")
+
+@bot.tree.command(name="settings")
+@guild_only_app()
+async def settings_cmd(interaction: discord.Interaction):
+    settings = load_settings()
+    desc = (
+        f"**Staff Role:** <@&{settings.get('staff_role', 'Not set')}>\n"
+        f"**Log Channel:** <#{settings.get('log_channel', 'Not set')}>\n"
+        f"**Ticket Category:** {settings.get('ticket_category', 'Not set')}\n"
+        f"**Cooldown:** {settings.get('cooldown', 60)} seconds\n"
+        f"**Active Tickets:** {len(settings.get('active_tickets', {}))}"
+    )
+    embed = discord.Embed(title="ModMail Settings", description=desc, color=discord.Color.blurple())
+    embed.set_footer(text="@u4_straight1", icon_url="https://i.postimg.cc/rp5b7Jkn/IMG-6152.jpg")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+@bot.tree.command(name="set_staff_role")
+@guild_only_app()
+@app_commands.describe(role="Role for staff")
+async def set_staff_role(interaction: discord.Interaction, role: discord.Role):
+    settings = load_settings()
+    settings["staff_role"] = role.id
+    save_settings(settings)
+    await interaction.response.send_message(f"Staff role set to {role.mention} ✅", ephemeral=True)
+
+@bot.tree.command(name="set_log_channel")
+@guild_only_app()
+@app_commands.describe(channel="Channel for logs")
+async def set_log_channel(interaction: discord.Interaction, channel: discord.TextChannel):
+    settings = load_settings()
+    settings["log_channel"] = channel.id
+    save_settings(settings)
+    await interaction.response.send_message(f"Log channel set to {channel.mention} ✅", ephemeral=True)
+
+@bot.tree.command(name="set_category")
+@guild_only_app()
+@app_commands.describe(category="Category for tickets")
+async def set_category(interaction: discord.Interaction, category: discord.CategoryChannel):
+    settings = load_settings()
+    settings["ticket_category"] = category.id
+    save_settings(settings)
+    await interaction.response.send_message(f"Ticket category set to {category.name} ✅", ephemeral=True)
+
+@bot.tree.command(name="set_cooldown")
+@guild_only_app()
+@app_commands.describe(seconds="Cooldown in seconds")
+async def set_cooldown(interaction: discord.Interaction, seconds: int):
+    settings = load_settings()
+    settings["cooldown"] = seconds
+    save_settings(settings)
+    await interaction.response.send_message(f"Cooldown set to {seconds} seconds ✅", ephemeral=True)
 
 bot.run(BOT_TOKEN)
