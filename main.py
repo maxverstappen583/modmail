@@ -48,11 +48,6 @@ def save_settings(settings):
 intents = discord.Intents.all()
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-@bot.event
-async def on_ready():
-    print(f"{bot.user} is online and ready!")
-    await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.watching, name="Mod Mail"))
-
 # ===== GUILD CHECK DECORATORS =====
 def guild_only_command():
     async def predicate(ctx):
@@ -297,5 +292,17 @@ async def set_cooldown(interaction: discord.Interaction, seconds: int):
     settings["cooldown"] = seconds
     save_settings(settings)
     await interaction.response.send_message(f"Cooldown set to {seconds} seconds ✅", ephemeral=True)
+
+# ===== SYNC SLASH COMMANDS =====
+@bot.event
+async def on_ready():
+    print(f"{bot.user} is online and ready!")
+    await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.watching, name="Mod Mail"))
+    guild = discord.Object(id=GUILD_ID)
+    try:
+        await bot.tree.sync(guild=guild)
+        print(f"Slash commands synced to guild {GUILD_ID} ✅")
+    except Exception as e:
+        print("Failed to sync commands:", e)
 
 bot.run(BOT_TOKEN)
