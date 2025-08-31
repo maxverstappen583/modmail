@@ -273,13 +273,8 @@ async def set_cooldown(interaction: discord.Interaction, seconds: int):
 async def on_ready():
     print(f"{bot.user} is online and ready!")
     await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.watching, name="Mod Mail"))
-
-    # Sync commands to guild
     guild = discord.Object(id=GUILD_ID)
-    try:
-        await bot.tree.sync(guild=guild)
-        print(f"Slash commands synced to guild {GUILD_ID} ✅")
-    except Exception as e:
-        print("Failed to sync commands:", e)
+    await bot.tree.sync(guild=guild)
+    print(f"Slash commands synced to guild {GUILD_ID} ✅")
 
 bot.run(BOT_TOKEN)
