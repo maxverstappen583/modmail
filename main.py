@@ -53,11 +53,11 @@ async def on_ready():
     print(f"{bot.user} is online and ready!")
     await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.watching, name="Mod Mail"))
 
-# ===== GUILD CHECK DECORATOR =====
-def guild_only():
+# ===== GUILD CHECK DECORATORS =====
+def guild_only_command():
     async def predicate(ctx):
         if ctx.guild is None:
-            return True
+            return True  # Allow DM commands
         if ctx.guild.id != GUILD_ID:
             await ctx.send(OTHER_GUILD_RESPONSE, ephemeral=True)
             return False
@@ -179,9 +179,6 @@ class SolvedButton(ui.View):
 async def on_message(message):
     if message.author.bot:
         return
-    if message.guild and message.guild.id != GUILD_ID:
-        await message.channel.send(OTHER_GUILD_RESPONSE)
-        return
 
     settings = load_settings()
     guild = bot.get_guild(GUILD_ID)
@@ -241,7 +238,7 @@ async def on_typing(channel, user, when):
 
 # ===== COMMANDS =====
 @bot.command()
-@guild_only()
+@guild_only_command()
 async def refresh(ctx):
     await ctx.send("Panel refreshed ✅")
 
