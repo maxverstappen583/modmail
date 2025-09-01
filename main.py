@@ -1,15 +1,6 @@
 # main.py
-# Full ModMail bot (single file)
-# - Guild-locked slash commands (instant sync to your GUILD_ID)
-# - /send_panel, /refresh, /settings, /set_staff_role, /set_log_channel, /set_category, /set_cooldown, /close
-# - Panel (red embed) with "Open Ticket" button
-# - One ticket per user, cooldown support
-# - DM <-> ticket sync (text + attachments)
-# - Staff buttons: Problem Solved ✅, Not Solved ❎, Close Ticket 🔒
-# - Transcript (.txt) uploaded to log channel and DM'd to user
-# - Footer text + icon on all embeds
-# - Optional OpenAI summarization (if OPENAI_API_KEY set)
-# - Flask keep-alive (for hosting environments)
+# Full ModMail (Style 2: DM <-> Server relay) with 15s confirm countdown on panel open.
+# Put this file, .env, and requirements.txt together. Start with `python main.py`.
 
 import os
 import json
@@ -23,15 +14,13 @@ import discord
 from discord.ext import commands
 from discord import ui, ButtonStyle, app_commands
 
-# -------------------- Load .env --------------------
+# ---------------- Load environment ----------------
 load_dotenv()
-BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN", "").strip()
+BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN") or os.getenv("DISCORD_TOKEN") or ""
 GUILD_ID = int(os.getenv("GUILD_ID", "0"))
 OTHER_GUILD_RESPONSE = os.getenv("OTHER_GUILD_RESPONSE", "Sorry, this bot only works in the official server.")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")  # optional
 
-# Optional OpenAI setup (safe fallback if not available)
-USE_OPENAI = False
 if OPENAI_API_KEY:
     try:
         import openai
@@ -39,21 +28,21 @@ if OPENAI_API_KEY:
         USE_OPENAI = True
     except Exception:
         USE_OPENAI = False
+else:
+    USE_OPENAI = False
 
-# Footer config used in embeds
 FOOTER_TEXT = "@u4_straight1"
 FOOTER_ICON = "https://i.postimg.cc/rp5b7Jkn/IMG-6152.jpg"
 
-# Basic env validation
 if not BOT_TOKEN or GUILD_ID == 0:
-    raise SystemExit("Please set DISCORD_BOT_TOKEN and GUILD_ID in your .env before running this bot.")
+    raise SystemExit("ERROR: Set DISCORD_BOT_TOKEN and GUILD_ID in your .env before running.")
 
-# -------------------- Flask keep-alive --------------------
+# ---------------- Flask keepalive (for hosting) ----------------
 app = Flask("modmail_keepalive")
 
 @app.route("/")
 def _home():
-    return "ModMail bot is running."
+    return "ModMail bot alive."
 
 def _run_flask():
     port = int(os.getenv("PORT", "8080"))
@@ -61,25 +50,25 @@ def _run_flask():
 
 Thread(target=_run_flask, daemon=True).start()
 
-# -------------------- Settings storage --------------------
+# ---------------- Settings persistence ----------------
 SETTINGS_FILE = "modmail_settings.json"
-DEFAULT_SETTINGS = {
+DEFAULTS = {
     "staff_role": 0,
     "log_channel": 0,
     "ticket_category": 0,
     "cooldown": 60,
-    "active_tickets": {},  # "user_id" -> channel_id
+    "active_tickets": {},  # "user_id" (str) -> channel_id (int)
     "last_open": {}        # "user_id" -> iso timestamp
 }
 
 def load_settings():
     if not os.path.exists(SETTINGS_FILE):
         with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
-            json.dump(DEFAULT_SETTINGS, f, indent=2)
+            json.dump(DEFAULTS, f, indent=2)
     with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
         data = json.load(f)
     changed = False
-    for k, v in DEFAULT_SETTINGS.items():
+    for k, v in DEFAULTS.items():
         if k not in data:
             data[k] = v
             changed = True
@@ -93,34 +82,31 @@ def save_settings(data):
 
 settings = load_settings()
 
-# -------------------- Bot setup --------------------
-intents = discord.Intents.all()  # needed for DMs, member lookup, attachments, message content
+# ---------------- Bot initialization ----------------
+intents = discord.Intents.all()  # needed for DMs, member lookups, attachments, message_content
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# -------------------- Helpers --------------------
+# ---------------- Helpers ----------------
 def guild_only_app():
-    """Decorator ensuring slash commands only run in configured guild; otherwise send custom message."""
-    async def check(interaction: discord.Interaction) -> bool:
+    async def _check(interaction: discord.Interaction) -> bool:
         if interaction.guild is None:
-            return True  # allow DMs for potential future DM-only commands
+            return True
         if interaction.guild.id != GUILD_ID:
             try:
                 await interaction.response.send_message(OTHER_GUILD_RESPONSE, ephemeral=True)
             except Exception:
-                # ignore if response can't be sent
                 pass
             return False
         return True
-    return app_commands.check(check)
+    return app_commands.check(_check)
 
 def is_staff_member(member: discord.Member | discord.User) -> bool:
-    """Return True if a member is staff (role set) or has manage_guild/admin perms."""
     try:
-        staff_role_id = int(settings.get("staff_role") or 0)
+        sr = int(settings.get("staff_role") or 0)
     except Exception:
-        staff_role_id = 0
+        sr = 0
     if isinstance(member, discord.Member):
-        if staff_role_id and any(r.id == staff_role_id for r in member.roles):
+        if sr and any(r.id == sr for r in member.roles):
             return True
         if member.guild_permissions.manage_guild or member.guild_permissions.administrator:
             return True
@@ -129,9 +115,9 @@ def is_staff_member(member: discord.Member | discord.User) -> bool:
 def top_role_color(member: discord.Member | None) -> discord.Color:
     if not member:
         return discord.Color.greyple()
-    for role in reversed(member.roles):
-        if role.color.value != 0:
-            return role.color
+    for r in reversed(member.roles):
+        if r.color.value != 0:
+            return r.color
     return discord.Color.greyple()
 
 def create_user_embed(user: discord.abc.User, content: str, member_obj=None, attachments=None):
@@ -165,25 +151,28 @@ async def create_ticket_channel_for_user(guild: discord.Guild, user: discord.Use
         except Exception:
             pass
         return None
+
     cat = await ensure_category(guild)
     staff_role_id = int(settings.get("staff_role") or 0)
     overwrites = {
         guild.default_role: discord.PermissionOverwrite(read_messages=False),
         guild.me: discord.PermissionOverwrite(read_messages=True, send_messages=True, read_message_history=True),
-        member: discord.PermissionOverwrite(read_messages=True, send_messages=True, read_message_history=True)
+        member: discord.PermissionOverwrite(read_messages=True, send_messages=True, read_message_history=True),
     }
     if staff_role_id:
         role = guild.get_role(staff_role_id)
         if role:
             overwrites[role] = discord.PermissionOverwrite(read_messages=True, send_messages=True, read_message_history=True)
-    channel = await guild.create_text_channel(name=f"ticket-{user.id}", category=cat, overwrites=overwrites)
-    settings["active_tickets"][str(user.id)] = channel.id
+
+    ch = await guild.create_text_channel(name=f"ticket-{user.id}", category=cat, overwrites=overwrites)
+    settings["active_tickets"][str(user.id)] = ch.id
     save_settings(settings)
+
     ping_text = guild.get_role(staff_role_id).mention if staff_role_id and guild.get_role(staff_role_id) else "@here"
     intro = discord.Embed(title="🎫 New Ticket", description=f"{user.mention} opened a ticket. Staff please assist.", color=discord.Color.red())
     intro.set_footer(text=FOOTER_TEXT, icon_url=FOOTER_ICON)
-    await channel.send(content=ping_text, embed=intro, view=TicketControlsView(opener_id=user.id))
-    return channel
+    await ch.send(content=ping_text, embed=intro, view=TicketControlsView(opener_id=user.id))
+    return ch
 
 async def summarize_user_messages(channel: discord.TextChannel, user_id: int) -> str:
     collected = []
@@ -196,14 +185,12 @@ async def summarize_user_messages(channel: discord.TextChannel, user_id: int) ->
     text = "\n".join(collected[-30:]).strip()
     if not text:
         return "No clear problem detected."
-
     if USE_OPENAI:
         try:
             resp = openai.ChatCompletion.create(
                 model="gpt-3.5-turbo",
-                messages=[{"role":"user","content": f"Summarize the user's issue in one short sentence:\n\n{text}"}],
-                max_tokens=80,
-                temperature=0.2
+                messages=[{"role":"user","content":f"Summarize the user's issue in one sentence:\n\n{text}"}],
+                max_tokens=80
             )
             return resp.choices[0].message.content.strip()
         except Exception:
@@ -263,42 +250,103 @@ async def close_ticket_flow(channel: discord.TextChannel, closed_by: discord.abc
     except Exception:
         pass
 
-# -------------------- Views & Buttons --------------------
+# ---------------- Views ----------------
 class PanelView(ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
     @ui.button(label="Open Ticket", style=ButtonStyle.danger, custom_id="panel_open_ticket")
     async def open_ticket_button(self, interaction: discord.Interaction, button: ui.Button):
+        # Guard: only in configured guild
         if not interaction.guild or interaction.guild.id != GUILD_ID:
             return await interaction.response.send_message(OTHER_GUILD_RESPONSE, ephemeral=True)
-        uid = str(interaction.user.id)
-        active = settings.get("active_tickets", {})
-        last_open = settings.get("last_open", {})
-        if uid in active:
-            ch = interaction.guild.get_channel(active[uid])
-            if ch:
-                return await interaction.response.send_message(f"❌ You already have a ticket: {ch.mention}", ephemeral=True)
-            else:
-                active.pop(uid, None)
-                settings["active_tickets"] = active
-                save_settings(settings)
-        cd = int(settings.get("cooldown") or 0)
-        if cd and uid in last_open:
+
+        # Start the ephemeral 15s confirmation flow
+        confirm_view = ConfirmView(opener_id=interaction.user.id, guild=interaction.guild)
+        await interaction.response.send_message(f"Confirm opening a ticket — you have 15 seconds.", view=confirm_view, ephemeral=True)
+        # original_response returns the ephemeral message object we can edit
+        msg = await interaction.original_response()
+        # assign the message object into the view and start countdown loop
+        confirm_view.set_message(msg)
+        asyncio.create_task(confirm_view.start_countdown())
+
+class ConfirmView(ui.View):
+    def __init__(self, opener_id: int, guild: discord.Guild, timeout: int = 20):
+        super().__init__(timeout=None)
+        self.opener_id = opener_id
+        self.msg = None
+        self.guild = guild
+        self._done = asyncio.Event()
+        self._confirmed = False
+        self._cancelled = False
+        self.seconds = 15
+
+    def set_message(self, msg: discord.Message):
+        self.msg = msg
+
+    async def start_countdown(self):
+        # update ephemeral message every second with remaining seconds
+        try:
+            for i in range(self.seconds, 0, -1):
+                if self._done.is_set():
+                    break
+                try:
+                    await self.msg.edit(content=f"Confirm opening a ticket — time remaining: **{i}s**", view=self)
+                except Exception:
+                    pass
+                await asyncio.sleep(1)
+            if not self._done.is_set():
+                # time expired -> cancel
+                self._cancelled = True
+                try:
+                    await self.msg.edit(content="⏰ Confirmation timed out. Ticket not created.", view=None)
+                except Exception:
+                    pass
+                self._done.set()
+        except Exception:
+            pass
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        # only allow the opener to confirm/cancel
+        if interaction.user.id != self.opener_id:
+            await interaction.response.send_message("Only the ticket opener can use these buttons.", ephemeral=True)
+            return False
+        return True
+
+    @ui.button(label="✅ Confirm", style=ButtonStyle.success, custom_id="confirm_yes")
+    async def confirm(self, interaction: discord.Interaction, button: ui.Button):
+        if self._done.is_set():
+            return await interaction.response.send_message("Action already completed.", ephemeral=True)
+        self._confirmed = True
+        self._done.set()
+        await interaction.response.defer(ephemeral=True)
+        # create ticket channel
+        ch = await create_ticket_channel_for_user(self.guild, interaction.user)
+        if ch:
             try:
-                last_ts = datetime.datetime.fromisoformat(last_open[uid])
-                delta = (datetime.datetime.utcnow() - last_ts).total_seconds()
-                if delta < cd:
-                    return await interaction.response.send_message(f"⏳ Please wait {int(cd-delta)}s before opening another ticket.", ephemeral=True)
+                await self.msg.edit(content=f"✅ Ticket created: {ch.mention}", view=None)
             except Exception:
                 pass
-        ch = await create_ticket_channel_for_user(interaction.guild, interaction.user)
-        if ch:
-            settings["last_open"][uid] = datetime.datetime.utcnow().isoformat()
-            save_settings(settings)
-            await interaction.response.send_message(f"✅ Ticket created: {ch.mention}", ephemeral=True)
+            # reply ephemeral ack
+            await interaction.followup.send(f"Your ticket was created: {ch.mention}", ephemeral=True)
         else:
-            await interaction.response.send_message("Unable to create ticket. Make sure you are a member of the server.", ephemeral=True)
+            try:
+                await self.msg.edit(content="❌ Could not create ticket. Make sure you're a guild member.", view=None)
+            except Exception:
+                pass
+            await interaction.followup.send("❌ Could not create ticket.", ephemeral=True)
+
+    @ui.button(label="❎ Cancel", style=ButtonStyle.secondary, custom_id="confirm_no")
+    async def cancel(self, interaction: discord.Interaction, button: ui.Button):
+        if self._done.is_set():
+            return await interaction.response.send_message("Action already completed.", ephemeral=True)
+        self._cancelled = True
+        self._done.set()
+        try:
+            await self.msg.edit(content="Cancelled. No ticket created.", view=None)
+        except Exception:
+            pass
+        await interaction.response.send_message("Cancelled — no ticket created.", ephemeral=True)
 
 class TicketControlsView(ui.View):
     def __init__(self, opener_id: int):
@@ -342,16 +390,16 @@ class CloseView(ui.View):
         await interaction.response.defer(ephemeral=True)
         await close_ticket_flow(interaction.channel, interaction.user)
 
-# -------------------- Events --------------------
+# ---------------- Events ----------------
 @bot.event
 async def on_ready():
-    print(f"Bot online as {bot.user} (id: {bot.user.id})")
+    print(f"✅ Bot logged in as {bot.user} (id: {bot.user.id})")
     try:
         await bot.tree.sync(guild=discord.Object(id=GUILD_ID))
-        print(f"Slash commands synced to guild {GUILD_ID}")
+        print(f"✅ Slash commands synced to guild {GUILD_ID}")
     except Exception as e:
-        print("Failed to sync slash commands:", e)
-    bot.add_view(PanelView())  # persistent panel
+        print("❌ Failed to sync slash commands:", e)
+    bot.add_view(PanelView())  # persist panel button handlers across restarts
     await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.watching, name="ModMail"))
 
 @bot.event
@@ -380,7 +428,7 @@ async def on_message(message: discord.Message):
     active = settings.get("active_tickets", {})
     guild = bot.get_guild(GUILD_ID)
 
-    # DM from user -> forward to ticket (create if needed)
+    # DM from user -> forward (create ticket automatically if none)
     if isinstance(message.channel, discord.DMChannel):
         uid = str(message.author.id)
         member = guild.get_member(message.author.id) if guild else None
@@ -432,7 +480,7 @@ async def on_message(message: discord.Message):
 
     await bot.process_commands(message)
 
-# -------------------- Slash Commands --------------------
+# ---------------- Slash commands ----------------
 @bot.tree.command(name="send_panel", description="Send the ModMail panel to this channel")
 @guild_only_app()
 async def cmd_send_panel(interaction: discord.Interaction):
@@ -442,7 +490,7 @@ async def cmd_send_panel(interaction: discord.Interaction):
     embed.set_footer(text=FOOTER_TEXT, icon_url=FOOTER_ICON)
     await interaction.response.send_message(embed=embed, view=PanelView())
 
-@bot.tree.command(name="refresh", description="Refresh (resync) slash commands")
+@bot.tree.command(name="refresh", description="Re-sync slash commands to the server")
 @guild_only_app()
 async def cmd_refresh(interaction: discord.Interaction):
     if not is_staff_member(interaction.user):
@@ -453,7 +501,7 @@ async def cmd_refresh(interaction: discord.Interaction):
     except Exception as e:
         await interaction.response.send_message(f"Failed to refresh: {e}", ephemeral=True)
 
-@bot.tree.command(name="settings", description="Show modmail settings")
+@bot.tree.command(name="settings", description="Show current ModMail settings")
 @guild_only_app()
 async def cmd_settings(interaction: discord.Interaction):
     if not is_staff_member(interaction.user):
@@ -476,7 +524,7 @@ async def cmd_settings(interaction: discord.Interaction):
     embed.set_footer(text=FOOTER_TEXT, icon_url=FOOTER_ICON)
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
-@bot.tree.command(name="set_staff_role", description="Set staff role (admins only)")
+@bot.tree.command(name="set_staff_role", description="Set the staff role (admin only)")
 @guild_only_app()
 @app_commands.describe(role="Role to assign as staff")
 async def cmd_set_staff_role(interaction: discord.Interaction, role: discord.Role):
@@ -486,7 +534,7 @@ async def cmd_set_staff_role(interaction: discord.Interaction, role: discord.Rol
     save_settings(settings)
     await interaction.response.send_message(f"✅ Staff role set to {role.mention}", ephemeral=True)
 
-@bot.tree.command(name="set_log_channel", description="Set channel to receive transcripts")
+@bot.tree.command(name="set_log_channel", description="Set channel for transcripts (admin only)")
 @guild_only_app()
 @app_commands.describe(channel="Text channel to send transcripts to")
 async def cmd_set_log_channel(interaction: discord.Interaction, channel: discord.TextChannel):
@@ -496,9 +544,9 @@ async def cmd_set_log_channel(interaction: discord.Interaction, channel: discord
     save_settings(settings)
     await interaction.response.send_message(f"✅ Log channel set to {channel.mention}", ephemeral=True)
 
-@bot.tree.command(name="set_category", description="Set ticket category")
+@bot.tree.command(name="set_category", description="Set ticket category (admin only)")
 @guild_only_app()
-@app_commands.describe(category="Category where tickets are created")
+@app_commands.describe(category="Category to create tickets in")
 async def cmd_set_category(interaction: discord.Interaction, category: discord.CategoryChannel):
     if not (interaction.user.guild_permissions.manage_guild or interaction.user.guild_permissions.administrator):
         return await interaction.response.send_message("You need Manage Server permission.", ephemeral=True)
@@ -506,13 +554,14 @@ async def cmd_set_category(interaction: discord.Interaction, category: discord.C
     save_settings(settings)
     await interaction.response.send_message(f"✅ Ticket category set to **{category.name}**", ephemeral=True)
 
-@bot.tree.command(name="set_cooldown", description="Set cooldown (seconds) between opens")
+@bot.tree.command(name="set_cooldown", description="Set cooldown between opens in seconds (admin only)")
 @guild_only_app()
-@app_commands.describe(seconds="Seconds (0 to disable)")
+@app_commands.describe(seconds="Seconds, 0 to disable")
 async def cmd_set_cooldown(interaction: discord.Interaction, seconds: int):
     if not (interaction.user.guild_permissions.manage_guild or interaction.user.guild_permissions.administrator):
         return await interaction.response.send_message("You need Manage Server permission.", ephemeral=True)
-    if seconds < 0: seconds = 0
+    if seconds < 0:
+        seconds = 0
     settings["cooldown"] = seconds
     save_settings(settings)
     await interaction.response.send_message(f"✅ Cooldown set to {seconds}s", ephemeral=True)
@@ -523,9 +572,9 @@ async def cmd_close(interaction: discord.Interaction):
     if not is_staff_member(interaction.user):
         return await interaction.response.send_message("Only staff can close tickets.", ephemeral=True)
     if not interaction.channel or not isinstance(interaction.channel, discord.TextChannel) or not interaction.channel.name.startswith("ticket-"):
-        return await interaction.response.send_message("This command must be used in a ticket channel.", ephemeral=True)
+        return await interaction.response.send_message("This command must be used inside a ticket channel.", ephemeral=True)
     await interaction.response.defer(ephemeral=True)
     await close_ticket_flow(interaction.channel, interaction.user)
 
-# -------------------- Run --------------------
+# ---------------- Run ----------------
 bot.run(BOT_TOKEN)
