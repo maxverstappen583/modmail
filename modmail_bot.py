@@ -486,4 +486,4 @@ async def on_ready():
 # -------------------------------
 if __name__ == "__main__":
     print("Starting modmail bot...")
-    bot.run(TOKEN)
+    bot.run(DISCORD_TOKEN)
