@@ -10,13 +10,13 @@ from flask import Flask
 from threading import Thread
 from datetime import datetime, timezone
 
-# Optional OpenAI support (only active if OPENAI_API_KEY provided)
+# Optional OpenAI support
 try:
     import openai
 except Exception:
     openai = None
 
-# Load dotenv if present
+# load dotenv if present (optional)
 try:
     from dotenv import load_dotenv
     load_dotenv()
@@ -24,7 +24,7 @@ except Exception:
     pass
 
 # -------------------------
-# ENVIRONMENT (token, guild, owner, openai)
+# Environment
 # -------------------------
 TOKEN = (
     os.getenv("DISCORD_TOKEN")
@@ -35,15 +35,14 @@ PRIMARY_GUILD_ID = int(os.getenv("PRIMARY_GUILD_ID", "1364371104755613837"))
 OWNER_ID = int(os.getenv("OWNER_ID", "1319292111325106296"))
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-# quick validation
 if not TOKEN:
-    print("❌ ERROR: No Discord token found. Set DISCORD_TOKEN or DISCORD_BOT_TOKEN in environment.")
+    print("❌ ERROR: No Discord token found. Please set DISCORD_TOKEN (or DISCORD_BOT_TOKEN) in environment.")
     sys.exit(1)
 
 if OPENAI_API_KEY and openai:
     openai.api_key = OPENAI_API_KEY
 
-# print which token env used (helpful in logs)
+# Helpful log: which env var was used
 if os.getenv("DISCORD_TOKEN"):
     print("Using DISCORD_TOKEN from environment.")
 elif os.getenv("DISCORD_BOT_TOKEN"):
@@ -52,7 +51,7 @@ elif os.getenv("TOKEN"):
     print("Using TOKEN from environment.")
 
 # -------------------------
-# Flask keep-alive (for hosts)
+# Flask keepalive
 # -------------------------
 app = Flask("modmail_keepalive")
 
@@ -67,7 +66,7 @@ def run_flask():
 Thread(target=run_flask, daemon=True).start()
 
 # -------------------------
-# Persistence (settings + tickets)
+# Persistence
 # -------------------------
 DATA_FILE = "modmail_data.json"
 DEFAULT_DATA = {
@@ -85,7 +84,6 @@ def load_data():
         return DEFAULT_DATA.copy()
     with open(DATA_FILE, "r") as f:
         d = json.load(f)
-    # ensure defaults
     for k, v in DEFAULT_DATA.items():
         if k not in d:
             d[k] = v
@@ -109,6 +107,20 @@ def is_staff(member: discord.Member):
         return False
     return any(r.id == role_id for r in member.roles)
 
+def mention_to_id(s: str):
+    """Convert mention like <#id> or <@&id> or plain id to int, else None"""
+    if not s:
+        return None
+    s = s.strip()
+    if s.startswith("<#") and s.endswith(">"):
+        s = s[2:-1]
+    if s.startswith("<@&") and s.endswith(">"):
+        s = s[3:-1]
+    try:
+        return int(s)
+    except Exception:
+        return None
+
 async def try_dm(user: discord.User, text: str):
     try:
         await user.send(text)
@@ -127,7 +139,7 @@ intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # -------------------------
-# Ticket UI (buttons)
+# Ticket view (buttons)
 # -------------------------
 class TicketView(ui.View):
     def __init__(self, ticket_user_id: int, timeout=None):
@@ -140,6 +152,8 @@ class TicketView(ui.View):
             return await interaction.response.send_message("This works only inside the server.", ephemeral=True)
         if not is_staff(interaction.user) and not interaction.user.guild_permissions.administrator:
             return await interaction.response.send_message("❎ You are not staff.", ephemeral=True)
+
+        # Notify channel and DM user
         embed = discord.Embed(
             title="✅ Problem Marked Solved",
             description=f"Marked solved by {interaction.user.mention}",
@@ -148,41 +162,20 @@ class TicketView(ui.View):
         )
         embed.add_field(name="Time", value=now_ts())
         await interaction.channel.send(embed=embed)
+        # DM the user linked to this ticket (if mapping exists)
+        ch_id = interaction.channel.id
+        user_id = None
+        for uid, cid in data.get("tickets", {}).items():
+            if cid == ch_id:
+                user_id = int(uid)
+                break
+        if user_id:
+            try:
+                user = await bot.fetch_user(user_id)
+                await user.send("✅ Your ticket has been marked **solved** by staff. If it's still an issue, reply here to re-open.")
+            except Exception:
+                pass
         await interaction.response.send_message("✅ Marked solved.", ephemeral=True)
-
-    @ui.button(label="AI Reply (draft)", style=discord.ButtonStyle.secondary, emoji="🤖")
-    async def ai_reply(self, interaction: discord.Interaction, button: ui.Button):
-        if not interaction.guild:
-            return await interaction.response.send_message("This works only inside the server.", ephemeral=True)
-        if not is_staff(interaction.user) and not interaction.user.guild_permissions.administrator:
-            return await interaction.response.send_message("❎ You are not staff.", ephemeral=True)
-        if not OPENAI_API_KEY or openai is None:
-            return await interaction.response.send_message("❎ OpenAI not configured.", ephemeral=True)
-
-        await interaction.response.defer(ephemeral=True, thinking=True)
-
-        msgs = []
-        async for m in interaction.channel.history(limit=30, oldest_first=False):
-            if m.author.bot:
-                continue
-            content = m.content or ("[attachment]" if m.attachments else "")
-            msgs.append(f"{m.author.name}: {content}")
-        convo = "\n".join(reversed(msgs[:30]))
-        prompt = (
-            "You are a professional support assistant. Given the conversation, draft a short professional reply staff can paste to the user.\n\n"
-            f"Conversation:\n{convo}\n\nReply:"
-        )
-        try:
-            completion = openai.ChatCompletion.create(
-                model="gpt-3.5-turbo",
-                messages=[{"role":"user","content":prompt}],
-                max_tokens=300,
-                temperature=0.2
-            )
-            reply = completion.choices[0].message.content.strip()
-            await interaction.followup.send(f"🤖 **AI draft:**\n\n{reply}", ephemeral=True)
-        except Exception as e:
-            await interaction.followup.send(f"❎ OpenAI error: {e}", ephemeral=True)
 
     @ui.button(label="Close Ticket (delete)", style=discord.ButtonStyle.danger, emoji="🗑️")
     async def close_ticket(self, interaction: discord.Interaction, button: ui.Button):
@@ -241,16 +234,17 @@ async def create_ticket_channel(guild: discord.Guild, user: discord.User):
     return ch
 
 # -------------------------
-# Message handling (DM -> ticket, keyword handling)
+# Message handling (DM -> ticket, staff -> user)
 # -------------------------
 @bot.event
 async def on_message(message: discord.Message):
-    await bot.process_commands(message)  # keep prefix commands working
+    # ensure prefix commands work
+    await bot.process_commands(message)
 
     if message.author.bot:
         return
 
-    # 1) DM -> create / forward ticket
+    # 1) DM -> create/forward to ticket channel
     if isinstance(message.channel, discord.DMChannel):
         user = message.author
         acct_days = (datetime.now(timezone.utc) - user.created_at).days
@@ -288,7 +282,7 @@ async def on_message(message: discord.Message):
             except Exception:
                 pass
 
-        # forward message content & attachments
+        # forward content and attachments to the channel
         forward = discord.Embed(
             title=f"📨 Message from {user}",
             description=message.content or "[attachment]",
@@ -311,18 +305,24 @@ async def on_message(message: discord.Message):
             pass
         return
 
-    # 2) In-guild messages: check ticket channels for keyword actions
+    # 2) In-guild ticket channels: staff messages forwarded to user and keyword handling
     if message.guild and message.guild.id == PRIMARY_GUILD_ID:
         ch_id = message.channel.id
-        if ch_id in list(data.get("tickets", {}).values()):
+        tickets_map = data.get("tickets", {})
+        # if this channel is one of our ticket channels
+        if ch_id in list(tickets_map.values()):
+            # ensure author is staff or admin to forward messages
             member = message.author
             if not is_staff(member) and not member.guild_permissions.administrator:
                 return
-            content = (message.content or "").strip().lower()
+
+            content = message.content or ""
+            # keyword handling
             solve_kw = (data.get("solve_keyword") or "solved").lower().strip()
             close_kw = (data.get("close_keyword") or "close").lower().strip()
-            matched_solve = (content == solve_kw) or content.startswith(solve_kw)
-            matched_close = (content == close_kw) or content.startswith(close_kw)
+            lc = content.strip().lower()
+            matched_solve = (lc == solve_kw) or lc.startswith(solve_kw)
+            matched_close = (lc == close_kw) or lc.startswith(close_kw)
             if matched_solve:
                 embed = discord.Embed(
                     title="✅ Problem Marked Solved",
@@ -336,7 +336,21 @@ async def on_message(message: discord.Message):
                     await message.delete()
                 except Exception:
                     pass
-            elif matched_close:
+                # DM user
+                target_uid = None
+                for uid, cid in tickets_map.items():
+                    if cid == ch_id:
+                        target_uid = int(uid)
+                        break
+                if target_uid:
+                    try:
+                        user = await bot.fetch_user(target_uid)
+                        await user.send("✅ Your ticket has been marked solved by staff. If it's still an issue, reply here to re-open.")
+                    except Exception:
+                        pass
+                return
+
+            if matched_close:
                 embed = discord.Embed(
                     title="🗑️ Ticket Closed",
                     description=f"Closed by {member.mention}",
@@ -345,57 +359,91 @@ async def on_message(message: discord.Message):
                 )
                 embed.add_field(name="Time", value=now_ts())
                 await message.channel.send(embed=embed)
-                to_remove = None
-                for uid, cid in list(data.get("tickets", {}).items()):
+                # remove mapping and delete channel
+                removed_uid = None
+                for uid, cid in list(tickets_map.items()):
                     if cid == ch_id:
-                        to_remove = uid
+                        removed_uid = uid
                         break
-                if to_remove:
-                    data["tickets"].pop(to_remove, None)
+                if removed_uid:
+                    data["tickets"].pop(removed_uid, None)
                     save_data(data)
                 await asyncio.sleep(3)
                 try:
                     await message.channel.delete(reason=f"Closed by keyword by {member}")
                 except Exception:
                     pass
+                return
+
+            # If not a keyword, forward the staff message to the user (including attachments)
+            target_uid = None
+            for uid, cid in tickets_map.items():
+                if cid == ch_id:
+                    target_uid = int(uid)
+                    break
+            if target_uid:
+                try:
+                    user = await bot.fetch_user(target_uid)
+                    # build embed
+                    staff_forward = discord.Embed(
+                        title=f"Reply from staff ({member.display_name})",
+                        description=content or "[attachment]",
+                        color=discord.Color.blue(),
+                        timestamp=datetime.now(timezone.utc)
+                    )
+                    staff_forward.set_footer(text=f"Staff: {member} • {now_ts()}")
+                    files = []
+                    for att in message.attachments:
+                        try:
+                            files.append(await att.to_file())
+                        except Exception:
+                            pass
+                    if files:
+                        await user.send(embed=staff_forward, files=files)
+                    else:
+                        await user.send(embed=staff_forward)
+                    # optional: confirm to staff
+                    try:
+                        await message.add_reaction("✅")
+                    except Exception:
+                        pass
+                except Exception:
+                    # Could not DM user (disabled DMs or blocked) — inform staff
+                    try:
+                        await message.channel.send(f"❌ Could not DM the user (DMS may be closed).")
+                    except Exception:
+                        pass
+                return
 
 # -------------------------
-# Slash commands (registered to PRIMARY_GUILD_ID)
+# Slash commands (guild-only) + prefix equivalents
 # -------------------------
-@bot.tree.command(name="set_category", description="Set the category where ticket channels will be created (admin only).")
-async def set_category(interaction: discord.Interaction, category: discord.CategoryChannel):
+# Setup: set category and staff role
+@bot.tree.command(name="setup", description="Set ticket category and staff role (admin only).")
+async def setup_slash(interaction: discord.Interaction, category: discord.CategoryChannel, staff_role: discord.Role):
     if not interaction.user.guild_permissions.administrator:
-        return await interaction.response.send_message("❎ You must be an administrator.", ephemeral=True)
+        return await interaction.response.send_message("❎ Admins only.", ephemeral=True)
     data["category_id"] = category.id
+    data["staff_role_id"] = staff_role.id
     save_data(data)
-    await interaction.response.send_message(f"✅ Category set to **{category.name}** — {now_ts()}", ephemeral=True)
+    await interaction.response.send_message(f"✅ Category set to **{category.name}** and staff role set to **{staff_role.name}** — {now_ts()}", ephemeral=True)
 
-@bot.tree.command(name="set_staff_role", description="Set the staff role for tickets (admin only).")
-async def set_staff_role(interaction: discord.Interaction, role: discord.Role):
-    if not interaction.user.guild_permissions.administrator:
-        return await interaction.response.send_message("❎ You must be an administrator.", ephemeral=True)
-    data["staff_role_id"] = role.id
+@bot.command(name="setup")
+@commands.has_permissions(administrator=True)
+async def setup_prefix(ctx: commands.Context, category_arg: str, staff_role_arg: str):
+    # category_arg can be id or mention like <#id>; staff_role_arg can be id or mention like <@&id>
+    cat_id = mention_to_id(category_arg) or None
+    role_id = mention_to_id(staff_role_arg) or None
+    if not cat_id or not role_id:
+        return await ctx.send("❌ Invalid args. Use `!setup <category_id|#mention> <role_id|@mention>`")
+    data["category_id"] = int(cat_id)
+    data["staff_role_id"] = int(role_id)
     save_data(data)
-    await interaction.response.send_message(f"✅ Staff role set to **{role.name}** — {now_ts()}", ephemeral=True)
+    await ctx.send(f"✅ Category and staff role set. Category ID: `{cat_id}`, Role ID: `{role_id}`")
 
-@bot.tree.command(name="set_solve_keyword", description="Set the keyword staff can type to mark solved (admin only).")
-async def set_solve_keyword(interaction: discord.Interaction, keyword: str):
-    if not interaction.user.guild_permissions.administrator:
-        return await interaction.response.send_message("❎ Admins only.", ephemeral=True)
-    data["solve_keyword"] = keyword.strip()
-    save_data(data)
-    await interaction.response.send_message(f"✅ Solve keyword set to `{keyword}` — {now_ts()}", ephemeral=True)
-
-@bot.tree.command(name="set_close_keyword", description="Set the keyword staff can type to close a ticket (admin only).")
-async def set_close_keyword(interaction: discord.Interaction, keyword: str):
-    if not interaction.user.guild_permissions.administrator:
-        return await interaction.response.send_message("❎ Admins only.", ephemeral=True)
-    data["close_keyword"] = keyword.strip()
-    save_data(data)
-    await interaction.response.send_message(f"✅ Close keyword set to `{keyword}` — {now_ts()}", ephemeral=True)
-
-@bot.tree.command(name="settings", description="Show current modmail settings (admins only).")
-async def settings(interaction: discord.Interaction):
+# Settings: show current settings
+@bot.tree.command(name="settings", description="Show current modmail settings (admin only).")
+async def settings_slash(interaction: discord.Interaction):
     if not interaction.user.guild_permissions.administrator:
         return await interaction.response.send_message("❎ Admins only.", ephemeral=True)
     guild = bot.get_guild(PRIMARY_GUILD_ID)
@@ -406,13 +454,82 @@ async def settings(interaction: discord.Interaction):
     embed.add_field(name="Staff Role", value=(f"{staff_role.name} ({staff_role.id})" if staff_role else "❎ Not set"), inline=False)
     embed.add_field(name="Solve Keyword", value=f"`{data.get('solve_keyword')}`", inline=True)
     embed.add_field(name="Close Keyword", value=f"`{data.get('close_keyword')}`", inline=True)
-    embed.add_field(name="Primary Guild ID", value=str(PRIMARY_GUILD_ID), inline=False)
-    embed.add_field(name="OpenAI configured", value=("✅ Yes" if OPENAI_API_KEY and openai else "❎ No"), inline=False)
-    embed.set_footer(text=f"Requested by {interaction.user} • {now_ts()}")
+    embed.add_field(name="Open Tickets", value=str(len(data.get("tickets", {}))), inline=False)
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
-@bot.tree.command(name="force_close", description="Force close this ticket (staff/admin only; deletes channel).")
-async def force_close(interaction: discord.Interaction):
+@bot.command(name="settings")
+@commands.has_permissions(administrator=True)
+async def settings_prefix(ctx: commands.Context):
+    guild = bot.get_guild(PRIMARY_GUILD_ID)
+    category = guild.get_channel(data.get("category_id")) if data.get("category_id") else None
+    staff_role = guild.get_role(data.get("staff_role_id")) if data.get("staff_role_id") else None
+    embed = discord.Embed(title="⚙️ Modmail Settings", color=discord.Color.blue(), timestamp=datetime.now(timezone.utc))
+    embed.add_field(name="Category", value=(f"{category.name} ({category.id})" if category else "❎ Not set"), inline=False)
+    embed.add_field(name="Staff Role", value=(f"{staff_role.name} ({staff_role.id})" if staff_role else "❎ Not set"), inline=False)
+    embed.add_field(name="Solve Keyword", value=f"`{data.get('solve_keyword')}`", inline=True)
+    embed.add_field(name="Close Keyword", value=f"`{data.get('close_keyword')}`", inline=True)
+    embed.add_field(name="Open Tickets", value=str(len(data.get("tickets", {}))), inline=False)
+    await ctx.send(embed=embed)
+
+# Set solve keyword
+@bot.tree.command(name="set_solve_keyword", description="Set staff keyword to mark solved (admin only).")
+async def set_solve_keyword_slash(interaction: discord.Interaction, keyword: str):
+    if not interaction.user.guild_permissions.administrator:
+        return await interaction.response.send_message("❎ Admins only.", ephemeral=True)
+    data["solve_keyword"] = keyword.strip()
+    save_data(data)
+    await interaction.response.send_message(f"✅ Solve keyword set to `{keyword}` — {now_ts()}", ephemeral=True)
+
+@bot.command(name="set_solve_keyword")
+@commands.has_permissions(administrator=True)
+async def set_solve_keyword_prefix(ctx: commands.Context, keyword: str):
+    data["solve_keyword"] = keyword.strip()
+    save_data(data)
+    await ctx.send(f"✅ Solve keyword set to `{keyword}`")
+
+# Set close keyword
+@bot.tree.command(name="set_close_keyword", description="Set staff keyword to close ticket (admin only).")
+async def set_close_keyword_slash(interaction: discord.Interaction, keyword: str):
+    if not interaction.user.guild_permissions.administrator:
+        return await interaction.response.send_message("❎ Admins only.", ephemeral=True)
+    data["close_keyword"] = keyword.strip()
+    save_data(data)
+    await interaction.response.send_message(f"✅ Close keyword set to `{keyword}` — {now_ts()}", ephemeral=True)
+
+@bot.command(name="set_close_keyword")
+@commands.has_permissions(administrator=True)
+async def set_close_keyword_prefix(ctx: commands.Context, keyword: str):
+    data["close_keyword"] = keyword.strip()
+    save_data(data)
+    await ctx.send(f"✅ Close keyword set to `{keyword}`")
+
+# List tickets
+@bot.tree.command(name="list_tickets", description="List open tickets (admin only).")
+async def list_tickets_slash(interaction: discord.Interaction):
+    if not interaction.user.guild_permissions.administrator:
+        return await interaction.response.send_message("❎ Admins only.", ephemeral=True)
+    tickets = data.get("tickets", {})
+    if not tickets:
+        return await interaction.response.send_message("❎ No open tickets.", ephemeral=True)
+    lines = []
+    for uid, cid in tickets.items():
+        lines.append(f"User `{uid}` → Channel ID `{cid}`")
+    await interaction.response.send_message("Open tickets:\n" + "\n".join(lines), ephemeral=True)
+
+@bot.command(name="list_tickets")
+@commands.has_permissions(administrator=True)
+async def list_tickets_prefix(ctx: commands.Context):
+    tickets = data.get("tickets", {})
+    if not tickets:
+        return await ctx.send("❎ No open tickets.")
+    lines = []
+    for uid, cid in tickets.items():
+        lines.append(f"User `{uid}` → Channel ID `{cid}`")
+    await ctx.send("Open tickets:\n" + "\n".join(lines))
+
+# Force close (in-channel)
+@bot.tree.command(name="force_close", description="Force close this ticket (staff/admin only).")
+async def force_close_slash(interaction: discord.Interaction):
     ch = interaction.channel
     if not isinstance(ch, discord.TextChannel):
         return await interaction.response.send_message("❎ This must be used in a ticket channel.", ephemeral=True)
@@ -434,21 +551,32 @@ async def force_close(interaction: discord.Interaction):
     except Exception:
         pass
 
-@bot.tree.command(name="list_tickets", description="List current open tickets (admin only).")
-async def list_tickets(interaction: discord.Interaction):
-    if not interaction.user.guild_permissions.administrator:
-        return await interaction.response.send_message("❎ Admins only.", ephemeral=True)
-    tickets = data.get("tickets", {})
-    if not tickets:
-        return await interaction.response.send_message("❎ No open tickets.", ephemeral=True)
-    lines = []
-    for uid, cid in tickets.items():
-        lines.append(f"User `{uid}` → Channel ID `{cid}`")
-    chunk = "\n".join(lines)
-    await interaction.response.send_message(f"Open tickets:\n{chunk}", ephemeral=True)
+@bot.command(name="force_close")
+@commands.has_permissions(manage_channels=True)
+async def force_close_prefix(ctx: commands.Context):
+    ch = ctx.channel
+    if not isinstance(ch, discord.TextChannel):
+        return await ctx.send("❎ This must be used in a ticket channel.")
+    if not is_staff(ctx.author) and not ctx.author.guild_permissions.administrator:
+        return await ctx.send("❎ Staff only.")
+    await ctx.send("✅ Force closing and deleting channel in 4s...")
+    ch_id = ch.id
+    to_remove = None
+    for uid, cid in list(data.get("tickets", {}).items()):
+        if cid == ch_id:
+            to_remove = uid
+            break
+    if to_remove:
+        data["tickets"].pop(to_remove, None)
+        save_data(data)
+    await asyncio.sleep(4)
+    try:
+        await ch.delete(reason=f"Force-closed by {ctx.author}")
+    except Exception:
+        pass
 
 # -------------------------
-# Prefix commands: refresh & restart (owner only)
+# Owner-only: refresh & restart (prefix + slash)
 # -------------------------
 @bot.command(name="refresh")
 async def refresh_prefix(ctx: commands.Context):
@@ -464,6 +592,17 @@ async def refresh_prefix(ctx: commands.Context):
         err = f"❌ Refresh failed: {e}"
         print(err)
         await ctx.send(err)
+
+@bot.tree.command(name="refresh", description="Refresh/sync slash commands for primary guild (owner only).")
+async def refresh_slash(interaction: discord.Interaction):
+    if interaction.user.id != OWNER_ID:
+        return await interaction.response.send_message("❎ Owner only.", ephemeral=True)
+    await interaction.response.send_message("🔁 Refreshing commands for primary guild...", ephemeral=True)
+    try:
+        synced = await bot.tree.sync(guild=discord.Object(id=PRIMARY_GUILD_ID))
+        await interaction.followup.send(f"✅ Synced {len(synced)} commands to primary guild — {now_ts()}", ephemeral=True)
+    except Exception as e:
+        await interaction.followup.send(f"❌ Sync error: {e}", ephemeral=True)
 
 @bot.command(name="restart")
 async def restart_prefix(ctx: commands.Context):
@@ -482,20 +621,6 @@ async def restart_prefix(ctx: commands.Context):
         await ctx.send(f"❌ Restart failed: {e}. Exiting instead.")
         sys.exit(0)
 
-# -------------------------
-# Slash owner commands: refresh & restart
-# -------------------------
-@bot.tree.command(name="refresh", description="Refresh/sync slash commands for primary guild (owner only).")
-async def refresh_slash(interaction: discord.Interaction):
-    if interaction.user.id != OWNER_ID:
-        return await interaction.response.send_message("❎ Owner only.", ephemeral=True)
-    await interaction.response.send_message("🔁 Refreshing commands for primary guild...", ephemeral=True)
-    try:
-        synced = await bot.tree.sync(guild=discord.Object(id=PRIMARY_GUILD_ID))
-        await interaction.followup.send(f"✅ Synced {len(synced)} commands to primary guild — {now_ts()}", ephemeral=True)
-    except Exception as e:
-        await interaction.followup.send(f"❌ Sync error: {e}", ephemeral=True)
-
 @bot.tree.command(name="restart", description="Restart the bot (owner only).")
 async def restart_slash(interaction: discord.Interaction):
     if interaction.user.id != OWNER_ID:
@@ -510,7 +635,7 @@ async def restart_slash(interaction: discord.Interaction):
         python = sys.executable
         os.execv(python, [python] + sys.argv)
     except Exception as e:
-        await interaction.followup.send(f"❎ Restart failed: {e}. Exiting instead.", ephemeral=True)
+        await interaction.followup.send(f"❌ Restart failed: {e}. Exiting instead.", ephemeral=True)
         sys.exit(0)
 
 # -------------------------
@@ -518,7 +643,7 @@ async def restart_slash(interaction: discord.Interaction):
 # -------------------------
 @bot.event
 async def on_ready():
-    # Note: we do a guild-only sync so commands appear instantly in your server
+    # sync only to your guild (instant)
     try:
         synced = await bot.tree.sync(guild=discord.Object(id=PRIMARY_GUILD_ID))
         print(f"✅ Synced {len(synced)} commands to guild {PRIMARY_GUILD_ID}")
@@ -531,6 +656,7 @@ async def on_ready():
             print(f"❌ Global sync failed: {e2}")
 
     print(f"✅ Logged in as {bot.user} (ID: {bot.user.id})")
+    # DM owner where possible
     try:
         owner = await bot.fetch_user(OWNER_ID)
         host = os.getenv("HOSTNAME", "unknown-host")
