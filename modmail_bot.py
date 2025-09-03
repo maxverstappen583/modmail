@@ -1,73 +1,62 @@
 # modmail_bot.py
-# Full modmail bot with:
-# - 15s countdown confirm (15..14..13..), Confirm/Cancel buttons
-# - Tickets created in the configured category
-# - Messages forwarded both ways as styled cards (avatar, name, message, timestamp)
-# - Attachments forwarded (images embedded where possible)
-# - HTML transcript saved and posted to a configured log channel
-# - Prefix (!) and Slash (/) commands for setup, settings, keywords, log channel, refresh, restart, etc.
-# - Persistent storage in modmail_data.json
-# - Requires Pillow (PIL) for dominant color extraction from avatars
+# Full modmail bot (drop-in). Read comments slowly and deploy.
+
+# ---- small patch for Python 3.13 hosts that lack audioop (Render sometimes uses 3.13) ----
+import sys
+try:
+    # audioop-lts provides a drop-in replacement for audioop on Python 3.13+
+    import audioop_lts as _audioop_lts
+    sys.modules["audioop"] = _audioop_lts
+except Exception:
+    # if not installed, continue — discord.py may still import audioop and fail,
+    # so ensure audioop-lts is in requirements.txt on hosts that need it.
+    pass
 
 import os
-import sys
-
-# 🔧 Patch for Python 3.13 – replace missing audioop with audioop-lts
-try:
-    import audioop_lts
-    sys.modules["audioop"] = audioop_lts
-except ImportError:
-    pass
-    
 import json
 import asyncio
 import aiohttp
 from io import BytesIO
 from datetime import datetime, timezone
+from threading import Thread
 
 import discord
 from discord.ext import commands
 from discord import ui
 from flask import Flask
-from threading import Thread
-from PIL import Image  # Pillow required
 
-# optional OpenAI usage (not required)
-try:
-    import openai
-except Exception:
-    openai = None
+# Pillow (PIL) for color extraction
+from PIL import Image
 
-# dotenv optional
+# optional dotenv
 try:
     from dotenv import load_dotenv
     load_dotenv()
 except Exception:
     pass
 
-# -------------------------
-# Environment & config
-# -------------------------
+# -----------------------------
+# Environment / basic config
+# -----------------------------
 DISCORD_TOKEN = (
     os.getenv("DISCORD_TOKEN")
     or os.getenv("DISCORD_BOT_TOKEN")
     or os.getenv("TOKEN")
 )
+# replace default with your guild id if you want to hardcode
 PRIMARY_GUILD_ID = int(os.getenv("PRIMARY_GUILD_ID", "1364371104755613837"))
 OWNER_ID = int(os.getenv("OWNER_ID", "1319292111325106296"))
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 PORT = int(os.getenv("PORT", "10000"))
 
 if not DISCORD_TOKEN:
-    print("❌ ERROR: No Discord token found. Set DISCORD_TOKEN (or DISCORD_BOT_TOKEN / TOKEN).")
-    sys.exit(1)
+    print("ERROR: DISCORD_TOKEN environment variable not set.")
+    raise SystemExit(1)
 
-if OPENAI_API_KEY and openai:
-    openai.api_key = OPENAI_API_KEY
+print("Using DISCORD_TOKEN from environment.")
 
-# -------------------------
-# Flask keepalive (for render / hosting)
-# -------------------------
+# -----------------------------
+# Flask keepalive for hosting
+# -----------------------------
 app = Flask("modmail_keepalive")
 
 @app.route("/")
@@ -79,9 +68,9 @@ def run_flask():
 
 Thread(target=run_flask, daemon=True).start()
 
-# -------------------------
+# -----------------------------
 # Persistence
-# -------------------------
+# -----------------------------
 DATA_FILE = "modmail_data.json"
 DEFAULT_DATA = {
     "category_id": None,
@@ -89,7 +78,7 @@ DEFAULT_DATA = {
     "log_channel_id": None,
     "solve_keyword": "solved",
     "close_keyword": "close",
-    "tickets": {}   # "user_id" -> channel_id
+    "tickets": {}  # "user_id" -> channel_id
 }
 
 def load_data():
@@ -99,7 +88,7 @@ def load_data():
         return DEFAULT_DATA.copy()
     with open(DATA_FILE, "r", encoding="utf-8") as f:
         d = json.load(f)
-    # ensure missing keys
+    # ensure keys
     for k, v in DEFAULT_DATA.items():
         if k not in d:
             d[k] = v
@@ -111,18 +100,18 @@ def save_data(d):
 
 data = load_data()
 
-# in-memory transcript log: channel_id -> [entries]
-# entry: {author_name, author_id, avatar_url, color_hex, content, attachments: [{filename,url}], ts}
+# in-memory session logs for transcripts: channel_id -> list of entries
+# entry: {"author_name","author_id","avatar_url","color","content","attachments":[{"filename","url"}],"ts"}
 session_logs = {}
 
-# -------------------------
-# Utilities: time, http, image color
-# -------------------------
-def now_ts() -> str:
-    """Pretty timestamp for embed footer: dd/mm/yy, HH:MM AM/PM"""
+# -----------------------------
+# helpers: time / http / color
+# -----------------------------
+def now_ts():
+    # dd/mm/yy, 12-hour format with AM/PM
     return datetime.now(timezone.utc).strftime("%d/%m/%y, %I:%M %p")
 
-async def fetch_bytes(url: str) -> bytes | None:
+async def fetch_bytes(url: str):
     try:
         async with aiohttp.ClientSession() as sess:
             async with sess.get(url) as resp:
@@ -132,57 +121,56 @@ async def fetch_bytes(url: str) -> bytes | None:
         return None
     return None
 
-def dominant_color_from_bytes(b: bytes) -> tuple[int,int,int]:
-    """Return an (r,g,b) dominant color using Pillow (simple quantization)."""
+def dominant_color_from_bytes(b: bytes):
     try:
         img = Image.open(BytesIO(b)).convert("RGBA")
-        img = img.resize((40, 40)).convert("RGB")
-        colors = img.getcolors(40*40)
+        img_small = img.resize((40, 40)).convert("RGB")
+        colors = img_small.getcolors(40*40)
         if not colors:
             return (120,120,120)
         colors.sort(reverse=True, key=lambda x: x[0])
         for count, col in colors:
             r,g,b = col
+            # skip very light (likely background)
             if not (r > 240 and g > 240 and b > 240):
-                return (r,g,b)
+                return col
         return colors[0][1]
     except Exception:
         return (120,120,120)
 
-async def get_user_color(user: discord.User) -> discord.Color:
-    """Try accent/banner color, otherwise dominant color from avatar, otherwise default."""
-    # try to fetch full user for accent_color
+async def get_user_color(user: discord.User):
+    # Try accent/banner color via fetch, else dominant color from avatar, else fallback
     try:
         full = await user.fetch()
-        accent = getattr(full, "accent_color", None)
-        if accent:
+        ac = getattr(full, "accent_color", None)
+        if ac:
             try:
-                return accent if isinstance(accent, discord.Color) else discord.Color(accent)
+                # accent_color may already be discord.Color
+                if isinstance(ac, discord.Color):
+                    return ac
+                # if int
+                return discord.Color(ac)
             except Exception:
-                # accent might be an int
-                try:
-                    return discord.Color(int(accent))
-                except Exception:
-                    pass
+                pass
     except Exception:
         pass
 
-    # fallback to avatar dominant color
     try:
         url = str(user.display_avatar.url)
         b = await fetch_bytes(url)
         if b:
             r,g,bcol = dominant_color_from_bytes(b)
-            return discord.Color.from_rgb(r,g,bcol)
+            return discord.Color.from_rgb(r, g, bcol)
     except Exception:
         pass
+
     return discord.Color.dark_grey()
 
-def color_to_hex(color: discord.Color | int | tuple[int,int,int]) -> str:
+def color_to_hex(color):
     try:
         if isinstance(color, discord.Color):
             return "#{:06x}".format(color.value)
-        if isinstance(color, tuple) and len(color)==3:
+        if isinstance(color, tuple) and len(color) == 3:
             return "#{:02x}{:02x}{:02x}".format(*color)
         if isinstance(color, int):
             return "#{:06x}".format(color)
@@ -190,7 +178,7 @@ def color_to_hex(color: discord.Color | int | tuple[int,int,int]) -> str:
         pass
     return "#777777"
 
-def mention_to_id(s: str | None) -> int | None:
+def mention_to_id(s):
     if not s:
         return None
     s = s.strip()
@@ -209,32 +197,30 @@ async def try_dm(user: discord.User, text: str):
     except Exception:
         pass
 
-# -------------------------
-# Bot creation
-# -------------------------
+# -----------------------------
+# bot creation (must come before decorators)
+# -----------------------------
 intents = discord.Intents.default()
-intents.members = True
 intents.guilds = True
+intents.members = True
 intents.messages = True
 intents.message_content = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# -------------------------
-# Embed card builder (styled like screenshot)
-# -------------------------
-def build_styled_card(author_name: str, avatar_url: str, color: discord.Color, content: str, ts_str: str) -> discord.Embed:
-    """Return an embed that looks like the screenshot: small avatar, name, body text, timestamp footer, colored border."""
+# -----------------------------
+# embed/card builder
+# -----------------------------
+def build_card(author_name: str, avatar_url: str, color: discord.Color, content: str, ts_str: str):
     embed = discord.Embed(description=content or " ", color=color)
     embed.set_author(name=author_name, icon_url=avatar_url)
     embed.set_footer(text=ts_str)
     return embed
 
-# -------------------------
-# Transcript HTML generator
-# -------------------------
-def generate_html_transcript(channel: discord.TextChannel, entries: list[dict]) -> str:
-    """Create transcripts/transcript_{channel.id}_{ts}.html and return the filepath."""
+# -----------------------------
+# transcript HTML generator
+# -----------------------------
+def generate_html_transcript(channel: discord.TextChannel, entries: list):
     os.makedirs("transcripts", exist_ok=True)
     ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     filename = f"transcripts/transcript_{channel.id}_{ts}.html"
@@ -278,56 +264,15 @@ def generate_html_transcript(channel: discord.TextChannel, entries: list[dict]) 
         f.write("\n".join(parts))
     return filename
 
-# -------------------------
-# Create ticket channel helper
-# -------------------------
-async def create_ticket_channel(guild: discord.Guild, user: discord.User) -> discord.TextChannel | None:
-    cat_id = data.get("category_id")
-    if not cat_id:
-        # log to user
-        try:
-            await user.send("❌ Server does not have a ticket category set. An admin must run `!setup` first.")
-        except Exception:
-            pass
-        return None
-    category = guild.get_channel(cat_id)
-    if not category or not isinstance(category, discord.CategoryChannel):
-        try:
-            await user.send("❌ The configured ticket category is invalid. Admins must set a valid category.")
-        except Exception:
-            pass
-        return None
-
-    staff_role = guild.get_role(data.get("staff_role_id")) if data.get("staff_role_id") else None
-
-    overwrites = {
-        guild.default_role: discord.PermissionOverwrite(view_channel=False),
-        guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
-    }
-    if staff_role:
-        overwrites[staff_role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
-
-    channel_name = f"ticket-{user.id}"
-    try:
-        ch = await category.create_text_channel(channel_name, overwrites=overwrites, reason="Modmail ticket created")
-    except Exception:
-        # fallback to guild root
-        ch = await guild.create_text_channel(channel_name, overwrites=overwrites, reason="Modmail ticket created (fallback)")
-    data["tickets"][str(user.id)] = ch.id
-    save_data(data)
-    session_logs[ch.id] = []
-    # log to log channel if set
-    await log_event(guild, "Ticket Created", f"Ticket channel {ch.mention} created for {user} ({user.id}).", ch.id)
-    return ch
-
-# -------------------------
-# Logging helper (log channel messages)
-# -------------------------
+# -----------------------------
+# Logging helper: posts small events to log channel if set
+# -----------------------------
 async def log_event(guild: discord.Guild | None, title: str, description: str, channel_id: int | None = None):
     log_chan_id = data.get("log_channel_id")
     if not log_chan_id:
         return
     try:
+        # prefer passing guild channel when possible
         log_chan = guild.get_channel(log_chan_id) if guild else bot.get_channel(log_chan_id)
         if not log_chan:
             log_chan = bot.get_channel(log_chan_id)
@@ -340,22 +285,66 @@ async def log_event(guild: discord.Guild | None, title: str, description: str, c
     except Exception:
         pass
 
-# -------------------------
-# DM Confirm View with countdown
-# -------------------------
+# -----------------------------
+# ticket creation helper (robust)
+# -----------------------------
+async def create_ticket_channel_for_user(guild: discord.Guild, user: discord.User):
+    cat_id = data.get("category_id")
+    category = guild.get_channel(cat_id) if cat_id else None
+    if not category or not isinstance(category, discord.CategoryChannel):
+        # no valid category configured → inform admins and user fallback
+        try:
+            await try_dm(user, "❌ Ticket category is not set or invalid. Ask an admin to run `!setup`.")
+        except Exception:
+            pass
+        return None
+
+    staff_role = guild.get_role(data.get("staff_role_id")) if data.get("staff_role_id") else None
+
+    overwrites = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=False),
+        guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
+    }
+
+    # if the user is a member in the guild, allow them to see their own ticket
+    member = guild.get_member(user.id)
+    if member:
+        overwrites[member] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
+
+    if staff_role:
+        overwrites[staff_role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
+
+    channel_name = f"ticket-{user.id}"
+    try:
+        ch = await category.create_text_channel(channel_name, overwrites=overwrites, reason="Modmail ticket created")
+    except Exception:
+        # fallback: try creating at guild root
+        try:
+            ch = await guild.create_text_channel(channel_name, overwrites=overwrites, reason="Modmail ticket created (fallback)")
+        except Exception:
+            return None
+
+    data["tickets"][str(user.id)] = ch.id
+    save_data(data)
+    session_logs[ch.id] = []
+    await log_event(guild, "Ticket Created", f"Ticket channel {ch.mention} created for {user} ({user.id}).", ch.id)
+    return ch
+
+# -----------------------------
+# DM confirmation view (15s countdown with editing)
+# -----------------------------
 class DMConfirmView(ui.View):
     def __init__(self, user: discord.User, orig_message: discord.Message, timeout: int = 15):
         super().__init__(timeout=timeout)
         self.user = user
         self.orig_message = orig_message
-        self._message: discord.Message | None = None
-        self._task: asyncio.Task | None = None
+        self._message = None
+        self._task = None
         self._confirmed = False
         self._cancelled = False
         self._timeout = timeout
 
     async def start_countdown(self, sent_message: discord.Message):
-        """Call after sending the DM confirmation message to begin editing countdown text."""
         self._message = sent_message
         self._task = asyncio.create_task(self._countdown_loop())
 
@@ -365,7 +354,6 @@ class DMConfirmView(ui.View):
             while remaining > 0:
                 if self._message is None:
                     break
-                # rebuild embed with remaining seconds in footer
                 embed = discord.Embed(title="Confirm: Create Support Ticket?", description=self.orig_message.content or "[attachment]", color=discord.Color.gold())
                 try:
                     embed.set_thumbnail(url=self.user.display_avatar.url)
@@ -380,14 +368,12 @@ class DMConfirmView(ui.View):
                     pass
                 await asyncio.sleep(1)
                 remaining -= 1
-                # stop early if confirmed or cancelled
                 if self._confirmed or self._cancelled or self.is_finished():
                     return
-            # time up
+            # timed out
             if not self._confirmed:
                 self._cancelled = True
                 try:
-                    # disable buttons by clearing items and editing
                     self.clear_items()
                     if self._message:
                         embed = discord.Embed(title="Timed out", description="Ticket not created — confirmation timed out.", color=discord.Color.dark_grey())
@@ -409,23 +395,23 @@ class DMConfirmView(ui.View):
             return
 
     @ui.button(label="Confirm", style=discord.ButtonStyle.success, emoji="✅")
-    async def confirm_button(self, interaction: discord.Interaction, button: ui.Button):
+    async def confirm(self, interaction: discord.Interaction, button: ui.Button):
         if interaction.user.id != self.user.id:
             return await interaction.response.send_message("This confirmation is for the original user.", ephemeral=True)
         await interaction.response.defer(ephemeral=True, thinking=True)
         self._confirmed = True
-        # cancel the countdown loop
         if self._task and not self._task.done():
             self._task.cancel()
-        # create ticket and forward message
+
         guild = bot.get_guild(PRIMARY_GUILD_ID)
         if not guild:
-            await interaction.followup.send("❌ Support is unavailable right now.", ephemeral=True)
+            await interaction.followup.send("❌ Support unavailable right now.", ephemeral=True)
             self.stop()
             return
-        ch = await create_ticket_channel(guild, self.user)
+
+        ch = await create_ticket_channel_for_user(guild, self.user)
         if not ch:
-            await interaction.followup.send("❌ Could not create ticket. Admin: set a valid category with !setup.", ephemeral=True)
+            await interaction.followup.send("❌ Could not create ticket. Admins: set a valid category with `!setup`.", ephemeral=True)
             self.stop()
             return
 
@@ -441,23 +427,23 @@ class DMConfirmView(ui.View):
             except Exception:
                 pass
 
-        # user color
         color = await get_user_color(self.user)
-        card = build_styled_card(str(self.user), str(self.user.display_avatar.url), color, self.orig_message.content or "[attachment]", now_ts())
+        card = build_card(str(self.user), str(self.user.display_avatar.url), color, self.orig_message.content or "[attachment]", now_ts())
         if att_meta:
             first = att_meta[0]["filename"]
             ext = first.split(".")[-1].lower() if "." in first else ""
             if ext in ("png","jpg","jpeg","gif","webp","bmp","svg"):
                 card.set_image(url=f"attachment://{first}")
+
         try:
             if files:
-                await ch.send(embed=card, files=files)
+                await ch.send(embed=card, files=files, view=TicketView(ticket_user_id=self.user.id))
             else:
-                await ch.send(embed=card)
+                await ch.send(embed=card, view=TicketView(ticket_user_id=self.user.id))
         except Exception:
             pass
 
-        # log initial entry
+        # log the initial message to session_logs
         session_logs.setdefault(ch.id, []).append({
             "author_name": str(self.user),
             "author_id": self.user.id,
@@ -468,7 +454,6 @@ class DMConfirmView(ui.View):
             "ts": now_ts()
         })
 
-        # notify user
         try:
             await interaction.followup.send(f"✅ Ticket created: {ch.mention}. Staff will respond there.", ephemeral=True)
         except Exception:
@@ -483,7 +468,7 @@ class DMConfirmView(ui.View):
         self.stop()
 
     @ui.button(label="Cancel", style=discord.ButtonStyle.danger, emoji="❎")
-    async def cancel_button(self, interaction: discord.Interaction, button: ui.Button):
+    async def cancel(self, interaction: discord.Interaction, button: ui.Button):
         if interaction.user.id != self.user.id:
             return await interaction.response.send_message("This confirmation is for the original user.", ephemeral=True)
         self._cancelled = True
@@ -501,9 +486,9 @@ class DMConfirmView(ui.View):
             pass
         self.stop()
 
-# -------------------------
-# Ticket view (staff buttons) - Mark solved / Close (transcript + delete)
-# -------------------------
+# -----------------------------
+# TicketView for staff buttons
+# -----------------------------
 class TicketView(ui.View):
     def __init__(self, ticket_user_id: int, timeout: int | None = None):
         super().__init__(timeout=timeout)
@@ -516,7 +501,7 @@ class TicketView(ui.View):
         embed = discord.Embed(title="✅ Problem Marked Solved", description=f"Marked solved by {interaction.user.mention}", color=discord.Color.green())
         embed.add_field(name="Time", value=now_ts())
         await interaction.channel.send(embed=embed)
-        # DM user
+        # DM user and log
         ch_id = interaction.channel.id
         uid = None
         for k,v in data.get("tickets", {}).items():
@@ -528,7 +513,6 @@ class TicketView(ui.View):
                 await u.send("✅ Your ticket has been marked solved by staff. Reply here to re-open.")
             except Exception:
                 pass
-        # log
         session_logs.setdefault(ch_id, []).append({
             "author_name": str(interaction.user),
             "author_id": interaction.user.id,
@@ -548,16 +532,14 @@ class TicketView(ui.View):
         ch = interaction.channel
         ch_id = ch.id
         logs = session_logs.get(ch_id, [])
-        # generate transcript HTML and post it to log channel
         try:
             path = generate_html_transcript(ch, logs)
-            guild = ch.guild
-            await log_event(guild, "Ticket Closed", f"Ticket channel {ch.name} ({ch.id}) closed by {interaction.user}.", ch.id)
-            # send transcript to configured log channel (if any)
+            await log_event(ch.guild, "Ticket Closed", f"Ticket channel {ch.name} ({ch.id}) closed by {interaction.user}.", ch.id)
+            # send transcript to configured log channel if set
             log_chan_id = data.get("log_channel_id")
             if log_chan_id:
                 try:
-                    log_chan = guild.get_channel(log_chan_id) or bot.get_channel(log_chan_id)
+                    log_chan = ch.guild.get_channel(log_chan_id) or bot.get_channel(log_chan_id)
                     if log_chan:
                         await log_chan.send(content=f"Transcript for {ch.name} ({ch.id}):", file=discord.File(path))
                 except Exception:
@@ -575,25 +557,22 @@ class TicketView(ui.View):
         session_logs.pop(ch_id, None)
         await asyncio.sleep(5)
         try:
-            await ch.delete(reason=f"Closed by {interaction.user}")
+            await ch.delete(reason=f"Ticket closed by {interaction.user}")
         except Exception:
             pass
 
-# -------------------------
-# Message handler (DMs and ticket channels)
-# -------------------------
+# -----------------------------
+# Message handling: DMs and ticket channels
+# -----------------------------
 @bot.event
 async def on_message(message: discord.Message):
-    await bot.process_commands(message)  # ensure prefix commands still work
+    await bot.process_commands(message)
     if message.author.bot:
         return
 
-    # -------------------------
-    # DMs -> new ticket or forward to existing ticket
-    # -------------------------
+    # DMs
     if isinstance(message.channel, discord.DMChannel):
         user = message.author
-        # account age check: must be >= 5 weeks (~35 days)
         acct_days = (datetime.now(timezone.utc) - user.created_at).days
         if acct_days < 35:
             try:
@@ -609,15 +588,11 @@ async def on_message(message: discord.Message):
 
         uid = str(user.id)
         ch_id = data.get("tickets", {}).get(uid)
-        if ch_id:
-            channel = guild.get_channel(ch_id)
-        else:
-            channel = None
+        channel = guild.get_channel(ch_id) if ch_id else None
 
         if channel:
             # forward to existing ticket
             color = await get_user_color(user)
-            # prepare files & metadata
             files = []
             att_meta = []
             for att in message.attachments:
@@ -628,14 +603,12 @@ async def on_message(message: discord.Message):
                     att_meta.append({"filename": f.filename, "url": url})
                 except Exception:
                     pass
-
-            card = build_styled_card(str(user), str(user.display_avatar.url), color, message.content or "[attachment]", now_ts())
+            card = build_card(str(user), str(user.display_avatar.url), color, message.content or "[attachment]", now_ts())
             if att_meta:
                 first = att_meta[0]["filename"]
                 ext = first.split(".")[-1].lower() if "." in first else ""
                 if ext in ("png","jpg","jpeg","gif","webp","bmp","svg"):
                     card.set_image(url=f"attachment://{first}")
-
             try:
                 if files:
                     await channel.send(embed=card, files=files)
@@ -643,7 +616,6 @@ async def on_message(message: discord.Message):
                     await channel.send(embed=card)
             except Exception:
                 pass
-
             session_logs.setdefault(channel.id, []).append({
                 "author_name": str(user),
                 "author_id": user.id,
@@ -655,7 +627,7 @@ async def on_message(message: discord.Message):
             })
             return
 
-        # No ticket yet -> ask for 15s confirm
+        # No ticket yet -> confirmation dialog with countdown
         confirm_embed = discord.Embed(title="Confirm: Create Support Ticket?", description=message.content or "[attachment]", color=discord.Color.gold())
         try:
             confirm_embed.set_thumbnail(url=user.display_avatar.url)
@@ -664,36 +636,30 @@ async def on_message(message: discord.Message):
         if message.attachments:
             confirm_embed.add_field(name="Attachments", value="\n".join([f"- {a.filename}" for a in message.attachments]), inline=False)
         confirm_embed.set_footer(text="Press ✅ confirm or ❎ cancel. This request times out in 15s.")
-
-        # prepare files for preview (so user sees attachments in confirmation)
         preview_files = []
         for att in message.attachments:
             try:
                 preview_files.append(await att.to_file())
             except Exception:
                 pass
-
         view = DMConfirmView(user=user, orig_message=message, timeout=15)
         try:
             if preview_files:
                 sent = await user.send(embed=confirm_embed, view=view, files=preview_files)
             else:
                 sent = await user.send(embed=confirm_embed, view=view)
-            # start countdown editing
             await view.start_countdown(sent)
         except Exception:
             pass
         return
 
-    # -------------------------
-    # In-guild ticket channels -> staff messages forwarded to user & keywords handling
-    # -------------------------
+    # In-guild ticket channels
     if message.guild and message.guild.id == PRIMARY_GUILD_ID:
         ch_id = message.channel.id
         tickets_map = data.get("tickets", {})
         if ch_id in list(tickets_map.values()):
             member = message.author
-            # only staff or admins allowed to use ticket channel features/forward
+            # staff-only forwarding
             if not (is_staff(member) or member.guild_permissions.administrator):
                 return
 
@@ -712,7 +678,6 @@ async def on_message(message: discord.Message):
                     await message.delete()
                 except Exception:
                     pass
-                # DM user
                 target_uid = None
                 for uid,cid in tickets_map.items():
                     if cid == ch_id:
@@ -738,11 +703,10 @@ async def on_message(message: discord.Message):
                 embed = discord.Embed(title="🗑️ Ticket Closed", description=f"Closed by {member.mention}", color=discord.Color.dark_gray())
                 embed.add_field(name="Time", value=now_ts())
                 await message.channel.send(embed=embed)
-                # transcript
                 logs = session_logs.get(ch_id, [])
                 try:
                     path = generate_html_transcript(message.channel, logs)
-                    # send transcript to log channel
+                    # post transcript to configured log channel (if set)
                     log_chan_id = data.get("log_channel_id")
                     if log_chan_id:
                         try:
@@ -753,7 +717,7 @@ async def on_message(message: discord.Message):
                             pass
                 except Exception:
                     pass
-                # remove mapping and delete channel
+                # remove mapping and delete
                 removed_uid = None
                 for uid,cid in list(tickets_map.items()):
                     if cid == ch_id:
@@ -767,7 +731,6 @@ async def on_message(message: discord.Message):
                     await message.channel.delete(reason=f"Closed by keyword by {member}")
                 except Exception:
                     pass
-                # log event
                 await log_event(message.guild, "Ticket Closed", f"Ticket {message.channel.name} ({ch_id}) closed by {member}.", ch_id)
                 return
 
@@ -790,7 +753,7 @@ async def on_message(message: discord.Message):
                         except Exception:
                             pass
                     staff_color = member.color or discord.Color.dark_grey()
-                    card = build_styled_card(str(member), str(member.display_avatar.url), staff_color, content or "[attachment]", now_ts())
+                    card = build_card(str(member), str(member.display_avatar.url), staff_color, content or "[attachment]", now_ts())
                     if att_meta:
                         first = att_meta[0]["filename"]
                         ext = first.split(".")[-1].lower() if "." in first else ""
@@ -820,19 +783,18 @@ async def on_message(message: discord.Message):
                         pass
                 return
 
-# -------------------------
-# Helper: is_staff (checks stored staff role)
-# -------------------------
-def is_staff(member: discord.Member) -> bool:
+# -----------------------------
+# is_staff helper
+# -----------------------------
+def is_staff(member: discord.Member):
     r_id = data.get("staff_role_id")
     if not r_id:
         return False
     return any(r.id == r_id for r in member.roles)
 
-# -------------------------
-# Commands (both prefix & slash)
-# -------------------------
-# setup: category + staff role
+# -----------------------------
+# Commands (prefix & slash)
+# -----------------------------
 @bot.tree.command(name="setup", description="Set ticket category and staff role (admin only).")
 async def setup_slash(interaction: discord.Interaction, category: discord.CategoryChannel, staff_role: discord.Role):
     if not interaction.user.guild_permissions.administrator:
@@ -856,8 +818,7 @@ async def setup_prefix(ctx: commands.Context, category_arg: str, staff_role_arg:
     await ctx.send(f"✅ Category and staff role set. Category ID: `{cat_id}`, Role ID: `{role_id}`")
     await log_event(ctx.guild, "Settings Updated", f"Category set (ID {cat_id}), staff role set (ID {role_id}).")
 
-# set log channel
-@bot.tree.command(name="set_log_channel", description="Set the log channel where transcripts and events are posted (admin only).")
+@bot.tree.command(name="set_log_channel", description="Set the log channel where transcripts/events are posted (admin only).")
 async def set_log_channel_slash(interaction: discord.Interaction, channel: discord.TextChannel):
     if not interaction.user.guild_permissions.administrator:
         return await interaction.response.send_message("❎ Admins only.", ephemeral=True)
@@ -877,7 +838,6 @@ async def set_log_channel_prefix(ctx: commands.Context, channel_arg: str):
     await ctx.send(f"✅ Log channel set. Channel ID: `{cid}`")
     await log_event(ctx.guild, "Settings Updated", f"Log channel set (ID {cid}).")
 
-# settings
 @bot.tree.command(name="settings", description="Show current modmail settings (admin only).")
 async def settings_slash(interaction: discord.Interaction):
     if not interaction.user.guild_permissions.administrator:
@@ -912,7 +872,7 @@ async def settings_prefix(ctx: commands.Context):
     await ctx.send(embed=embed)
 
 # set keywords
-@bot.tree.command(name="set_solve_keyword", description="Set the keyword staff uses to mark solved (admin only).")
+@bot.tree.command(name="set_solve_keyword", description="Set staff keyword to mark solved (admin only).")
 async def set_solve_keyword_slash(interaction: discord.Interaction, keyword: str):
     if not interaction.user.guild_permissions.administrator:
         return await interaction.response.send_message("❎ Admins only.", ephemeral=True)
@@ -927,7 +887,7 @@ async def set_solve_keyword_prefix(ctx: commands.Context, keyword: str):
     save_data(data)
     await ctx.send(f"✅ Solve keyword set to `{keyword}`")
 
-@bot.tree.command(name="set_close_keyword", description="Set the keyword staff uses to close ticket (admin only).")
+@bot.tree.command(name="set_close_keyword", description="Set staff keyword to close ticket (admin only).")
 async def set_close_keyword_slash(interaction: discord.Interaction, keyword: str):
     if not interaction.user.guild_permissions.administrator:
         return await interaction.response.send_message("❎ Admins only.", ephemeral=True)
@@ -942,7 +902,6 @@ async def set_close_keyword_prefix(ctx: commands.Context, keyword: str):
     save_data(data)
     await ctx.send(f"✅ Close keyword set to `{keyword}`")
 
-# list tickets
 @bot.tree.command(name="list_tickets", description="List open tickets (admin only).")
 async def list_tickets_slash(interaction: discord.Interaction):
     if not interaction.user.guild_permissions.administrator:
@@ -975,7 +934,6 @@ async def force_close_slash(interaction: discord.Interaction):
     logs = session_logs.get(ch_id, [])
     try:
         path = generate_html_transcript(ch, logs)
-        # send transcript to log channel if set
         log_chan_id = data.get("log_channel_id")
         if log_chan_id:
             try:
@@ -1096,16 +1054,15 @@ async def restart_slash(interaction: discord.Interaction):
         await interaction.followup.send(f"❌ Restart failed: {e}. Exiting instead.", ephemeral=True)
         sys.exit(0)
 
-# commands list (help)
+# commands list/help
 @bot.command(name="commands")
 async def commands_list_prefix(ctx: commands.Context):
     embed = discord.Embed(title="📚 Modmail Commands (prefix & slash)", color=discord.Color.blurple())
     embed.add_field(name="Setup", value="`!setup <category_id|#mention> <role_id|@mention>`\n`/setup category:<category> staff_role:<role>`", inline=False)
     embed.add_field(name="Set Log Channel", value="`!set_log_channel <#channel|id>`\n`/set_log_channel channel:<channel>`", inline=False)
-    embed.add_field(name="Settings", value="`!settings` / `/settings` — shows current category/staff/log keywords and ticket count.", inline=False)
-    embed.add_field(name="Keywords", value="`!set_solve_keyword <word>` / `/set_solve_keyword` and `!set_close_keyword <word>` / `/set_close_keyword`", inline=False)
-    embed.add_field(name="Ticket Flow", value="Users DM bot → confirm in 15s (15..14..13) → ticket created. Staff replies forward to user. Attachments forwarded.", inline=False)
-    embed.add_field(name="Owner Tools", value="`!refresh` / `/refresh` — resync commands. `!restart` / `/restart` — restart bot.", inline=False)
+    embed.add_field(name="Settings", value="`!settings` / `/settings`", inline=False)
+    embed.add_field(name="Ticket Flow", value="Users DM bot → confirm 15s → ticket created in category. Staff replies forward to user. Attachments forwarded.", inline=False)
+    embed.add_field(name="Owner Tools", value="`!refresh` `!restart`", inline=False)
     await ctx.send(embed=embed)
 
 @bot.tree.command(name="commands", description="Show modmail commands and usage (prefix & slash).")
@@ -1113,29 +1070,27 @@ async def commands_list_slash(interaction: discord.Interaction):
     embed = discord.Embed(title="📚 Modmail Commands (prefix & slash)", color=discord.Color.blurple())
     embed.add_field(name="Setup", value="`!setup <category_id|#mention> <role_id|@mention>`\n`/setup category:<category> staff_role:<role>`", inline=False)
     embed.add_field(name="Set Log Channel", value="`!set_log_channel <#channel|id>`\n`/set_log_channel channel:<channel>`", inline=False)
-    embed.add_field(name="Settings", value="`!settings` / `/settings` — shows current category/staff/log keywords and ticket count.", inline=False)
-    embed.add_field(name="Keywords", value="`!set_solve_keyword <word>` / `/set_solve_keyword` and `!set_close_keyword <word>` / `/set_close_keyword`", inline=False)
-    embed.add_field(name="Ticket Flow", value="Users DM bot → confirm in 15s (15..14..13) → ticket created. Staff replies forward to user. Attachments forwarded.", inline=False)
-    embed.add_field(name="Owner Tools", value="`!refresh` / `/refresh` — resync commands. `!restart` / `/restart` — restart bot.", inline=False)
+    embed.add_field(name="Settings", value="`!settings` / `/settings`", inline=False)
+    embed.add_field(name="Ticket Flow", value="Users DM bot → confirm 15s → ticket created in category. Staff replies forward to user. Attachments forwarded.", inline=False)
+    embed.add_field(name="Owner Tools", value="`!refresh` `!restart`", inline=False)
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
-# -------------------------
-# on_ready: sync commands & DM owner
-# -------------------------
+# -----------------------------
+# on_ready: sync & owner DM
+# -----------------------------
 @bot.event
 async def on_ready():
     try:
         synced = await bot.tree.sync(guild=discord.Object(id=PRIMARY_GUILD_ID))
         print(f"✅ Synced {len(synced)} commands to guild {PRIMARY_GUILD_ID}")
     except Exception as e:
-        print(f"⚠️ Guild sync failed: {e}. Attempting global sync...")
+        print(f"⚠️ Guild sync failed: {e}. Trying global sync.")
         try:
             all_synced = await bot.tree.sync()
             print(f"✅ Globally synced {len(all_synced)} commands")
         except Exception as e2:
             print(f"❌ Global sync failed: {e2}")
     print(f"✅ Logged in as {bot.user} (ID: {bot.user.id})")
-    # DM owner
     try:
         owner = await bot.fetch_user(OWNER_ID)
         host = os.getenv("HOSTNAME", "unknown-host")
@@ -1143,13 +1098,13 @@ async def on_ready():
     except Exception:
         pass
 
-# -------------------------
-# Run
-# -------------------------
+# -----------------------------
+# Run the bot
+# -----------------------------
 if __name__ == "__main__":
     print("Starting modmail bot...")
     try:
         bot.run(DISCORD_TOKEN)
     except Exception as e:
-        print(f"❌ Bot failed to start: {e}")
+        print(f"Bot failed to start: {e}")
         raise
