@@ -10,39 +10,50 @@ from flask import Flask
 from threading import Thread
 from datetime import datetime, timezone
 
-# Optional OpenAI support (only if OPENAI_API_KEY provided)
+# Optional OpenAI support (only active if OPENAI_API_KEY provided)
 try:
     import openai
 except Exception:
     openai = None
 
-# -------------------------------
-# Load environment (.env supported)
-# -------------------------------
-from dotenv import load_dotenv
-load_dotenv()
+# Load dotenv if present
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
 
-# Token/env loading (accept a few common names)
+# -------------------------
+# ENVIRONMENT (token, guild, owner, openai)
+# -------------------------
 TOKEN = (
-    os.getenv("DISCORD_BOT_TOKEN")
-    or os.getenv("DISCORD_TOKEN")
+    os.getenv("DISCORD_TOKEN")
+    or os.getenv("DISCORD_BOT_TOKEN")
     or os.getenv("TOKEN")
 )
 PRIMARY_GUILD_ID = int(os.getenv("PRIMARY_GUILD_ID", "1364371104755613837"))
 OWNER_ID = int(os.getenv("OWNER_ID", "1319292111325106296"))
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-# Basic validation
+# quick validation
 if not TOKEN:
-    print("❌ ERROR: No Discord token found. Set DISCORD_BOT_TOKEN in environment.")
+    print("❌ ERROR: No Discord token found. Set DISCORD_TOKEN or DISCORD_BOT_TOKEN in environment.")
     sys.exit(1)
 
 if OPENAI_API_KEY and openai:
     openai.api_key = OPENAI_API_KEY
 
-# -------------------------------
-# Flask keep-alive
-# -------------------------------
+# print which token env used (helpful in logs)
+if os.getenv("DISCORD_TOKEN"):
+    print("Using DISCORD_TOKEN from environment.")
+elif os.getenv("DISCORD_BOT_TOKEN"):
+    print("Using DISCORD_BOT_TOKEN from environment.")
+elif os.getenv("TOKEN"):
+    print("Using TOKEN from environment.")
+
+# -------------------------
+# Flask keep-alive (for hosts)
+# -------------------------
 app = Flask("modmail_keepalive")
 
 @app.route("/")
@@ -50,14 +61,14 @@ def home():
     return "Modmail bot running."
 
 def run_flask():
-    port = int(os.getenv("PORT", 10000))
+    port = int(os.getenv("PORT", "10000"))
     app.run(host="0.0.0.0", port=port)
 
 Thread(target=run_flask, daemon=True).start()
 
-# -------------------------------
-# Data persistence
-# -------------------------------
+# -------------------------
+# Persistence (settings + tickets)
+# -------------------------
 DATA_FILE = "modmail_data.json"
 DEFAULT_DATA = {
     "category_id": None,
@@ -74,7 +85,7 @@ def load_data():
         return DEFAULT_DATA.copy()
     with open(DATA_FILE, "r") as f:
         d = json.load(f)
-    # ensure defaults exist
+    # ensure defaults
     for k, v in DEFAULT_DATA.items():
         if k not in d:
             d[k] = v
@@ -86,9 +97,9 @@ def save_data(d):
 
 data = load_data()
 
-# -------------------------------
+# -------------------------
 # Helpers
-# -------------------------------
+# -------------------------
 def now_ts():
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
@@ -104,9 +115,9 @@ async def try_dm(user: discord.User, text: str):
     except Exception:
         pass
 
-# -------------------------------
+# -------------------------
 # Bot setup
-# -------------------------------
+# -------------------------
 intents = discord.Intents.default()
 intents.guilds = True
 intents.members = True
@@ -115,9 +126,9 @@ intents.message_content = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# -------------------------------
-# Ticket View (buttons)
-# -------------------------------
+# -------------------------
+# Ticket UI (buttons)
+# -------------------------
 class TicketView(ui.View):
     def __init__(self, ticket_user_id: int, timeout=None):
         super().__init__(timeout=timeout)
@@ -205,9 +216,9 @@ class TicketView(ui.View):
         except Exception:
             pass
 
-# -------------------------------
+# -------------------------
 # Create ticket channel helper
-# -------------------------------
+# -------------------------
 async def create_ticket_channel(guild: discord.Guild, user: discord.User):
     cat = guild.get_channel(data.get("category_id")) if data.get("category_id") else None
     staff_role = guild.get_role(data.get("staff_role_id")) if data.get("staff_role_id") else None
@@ -229,9 +240,9 @@ async def create_ticket_channel(guild: discord.Guild, user: discord.User):
     save_data(data)
     return ch
 
-# -------------------------------
+# -------------------------
 # Message handling (DM -> ticket, keyword handling)
-# -------------------------------
+# -------------------------
 @bot.event
 async def on_message(message: discord.Message):
     await bot.process_commands(message)  # keep prefix commands working
@@ -348,9 +359,9 @@ async def on_message(message: discord.Message):
                 except Exception:
                     pass
 
-# -------------------------------
+# -------------------------
 # Slash commands (registered to PRIMARY_GUILD_ID)
-# -------------------------------
+# -------------------------
 @bot.tree.command(name="set_category", description="Set the category where ticket channels will be created (admin only).")
 async def set_category(interaction: discord.Interaction, category: discord.CategoryChannel):
     if not interaction.user.guild_permissions.administrator:
@@ -423,10 +434,22 @@ async def force_close(interaction: discord.Interaction):
     except Exception:
         pass
 
-# -------------------------------
-# Owner-only commands: restart & refresh (both prefix + slash)
-# -------------------------------
-# Prefix: !refresh
+@bot.tree.command(name="list_tickets", description="List current open tickets (admin only).")
+async def list_tickets(interaction: discord.Interaction):
+    if not interaction.user.guild_permissions.administrator:
+        return await interaction.response.send_message("❎ Admins only.", ephemeral=True)
+    tickets = data.get("tickets", {})
+    if not tickets:
+        return await interaction.response.send_message("❎ No open tickets.", ephemeral=True)
+    lines = []
+    for uid, cid in tickets.items():
+        lines.append(f"User `{uid}` → Channel ID `{cid}`")
+    chunk = "\n".join(lines)
+    await interaction.response.send_message(f"Open tickets:\n{chunk}", ephemeral=True)
+
+# -------------------------
+# Prefix commands: refresh & restart (owner only)
+# -------------------------
 @bot.command(name="refresh")
 async def refresh_prefix(ctx: commands.Context):
     if ctx.author.id != OWNER_ID:
@@ -442,7 +465,6 @@ async def refresh_prefix(ctx: commands.Context):
         print(err)
         await ctx.send(err)
 
-# Prefix: !restart
 @bot.command(name="restart")
 async def restart_prefix(ctx: commands.Context):
     if ctx.author.id != OWNER_ID:
@@ -450,13 +472,19 @@ async def restart_prefix(ctx: commands.Context):
     await ctx.send("🔄 Restarting bot now...")
     await asyncio.sleep(1)
     try:
+        await bot.close()
+    except Exception:
+        pass
+    try:
         python = sys.executable
         os.execv(python, [python] + sys.argv)
     except Exception as e:
         await ctx.send(f"❌ Restart failed: {e}. Exiting instead.")
         sys.exit(0)
 
-# Slash: /refresh
+# -------------------------
+# Slash owner commands: refresh & restart
+# -------------------------
 @bot.tree.command(name="refresh", description="Refresh/sync slash commands for primary guild (owner only).")
 async def refresh_slash(interaction: discord.Interaction):
     if interaction.user.id != OWNER_ID:
@@ -468,7 +496,6 @@ async def refresh_slash(interaction: discord.Interaction):
     except Exception as e:
         await interaction.followup.send(f"❌ Sync error: {e}", ephemeral=True)
 
-# Slash: /restart
 @bot.tree.command(name="restart", description="Restart the bot (owner only).")
 async def restart_slash(interaction: discord.Interaction):
     if interaction.user.id != OWNER_ID:
@@ -476,22 +503,27 @@ async def restart_slash(interaction: discord.Interaction):
     await interaction.response.send_message("🔄 Restarting bot now...", ephemeral=True)
     await asyncio.sleep(1)
     try:
+        await bot.close()
+    except Exception:
+        pass
+    try:
         python = sys.executable
         os.execv(python, [python] + sys.argv)
     except Exception as e:
         await interaction.followup.send(f"❎ Restart failed: {e}. Exiting instead.", ephemeral=True)
         sys.exit(0)
 
-# -------------------------------
-# on_ready: register guild-only commands & DM owner
-# -------------------------------
+# -------------------------
+# on_ready: sync to guild & DM owner
+# -------------------------
 @bot.event
 async def on_ready():
+    # Note: we do a guild-only sync so commands appear instantly in your server
     try:
         synced = await bot.tree.sync(guild=discord.Object(id=PRIMARY_GUILD_ID))
         print(f"✅ Synced {len(synced)} commands to guild {PRIMARY_GUILD_ID}")
     except Exception as e:
-        print(f"⚠️ Guild sync failed: {e}. Trying global sync...")
+        print(f"⚠️ Guild sync failed: {e}. Attempting global sync...")
         try:
             all_synced = await bot.tree.sync()
             print(f"✅ Globally synced {len(all_synced)} commands")
@@ -499,7 +531,6 @@ async def on_ready():
             print(f"❌ Global sync failed: {e2}")
 
     print(f"✅ Logged in as {bot.user} (ID: {bot.user.id})")
-    # DM owner that bot is online
     try:
         owner = await bot.fetch_user(OWNER_ID)
         host = os.getenv("HOSTNAME", "unknown-host")
@@ -507,9 +538,13 @@ async def on_ready():
     except Exception as e:
         print(f"⚠️ Could not DM owner: {e}")
 
-# -------------------------------
-# Run the bot
-# -------------------------------
+# -------------------------
+# Run
+# -------------------------
 if __name__ == "__main__":
     print("Starting modmail bot...")
-    bot.run(TOKEN)
+    try:
+        bot.run(TOKEN)
+    except Exception as e:
+        print(f"❌ Bot failed to start: {e}")
+        raise
