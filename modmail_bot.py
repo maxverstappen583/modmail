@@ -10,41 +10,43 @@ from flask import Flask
 from threading import Thread
 from datetime import datetime, timezone
 
-# Optional OpenAI support (only active if OPENAI_API_KEY is provided)
+# Optional OpenAI support (only if OPENAI_API_KEY provided)
 try:
     import openai
 except Exception:
     openai = None
 
 # -------------------------------
-# Load environment (dotenv optional)
+# Load environment (.env supported)
 # -------------------------------
 from dotenv import load_dotenv
 load_dotenv()
 
-DISCORD_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
-PRIMARY_GUILD_ID = os.getenv("PRIMARY_GUILD_ID")
-OWNER_ID = int(os.getenv("OWNER_ID", "1319292111325106296"))  # fallback to your ID
+# Accept multiple token env names to avoid confusion
+DISCORD_TOKEN = (
+    os.getenv("DISCORD_BOT_TOKEN")
+    or os.getenv("DISCORD_TOKEN")
+    or os.getenv("TOKEN")
+)
+# Primary guild default (your provided guild)
+DEFAULT_GUILD_ID = "1364371104755613837"
+PRIMARY_GUILD_ID = int(os.getenv("PRIMARY_GUILD_ID", DEFAULT_GUILD_ID))
+
+# Owner ID default (yours)
+OWNER_ID = int(os.getenv("OWNER_ID", "1319292111325106296"))
+
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")  # optional
 
 # Basic validation
 if not DISCORD_TOKEN:
-    print("❌ ERROR: DISCORD_BOT_TOKEN not set. Exiting.")
-    sys.exit(1)
-if not PRIMARY_GUILD_ID:
-    print("❌ ERROR: PRIMARY_GUILD_ID not set. Exiting.")
-    sys.exit(1)
-try:
-    PRIMARY_GUILD_ID = int(PRIMARY_GUILD_ID)
-except Exception:
-    print("❌ ERROR: PRIMARY_GUILD_ID must be an integer. Exiting.")
+    print("❌ ERROR: No Discord token found. Set DISCORD_BOT_TOKEN or DISCORD_TOKEN in environment.")
     sys.exit(1)
 
 if OPENAI_API_KEY and openai:
     openai.api_key = OPENAI_API_KEY
 
 # -------------------------------
-# Flask keep-alive (for hosts)
+# Flask keep-alive
 # -------------------------------
 app = Flask("modmail_keepalive")
 
@@ -119,7 +121,7 @@ intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # -------------------------------
-# Ticket view (button UI)
+# Ticket View (buttons)
 # -------------------------------
 class TicketView(ui.View):
     def __init__(self, ticket_user_id: int, timeout=None):
@@ -132,10 +134,12 @@ class TicketView(ui.View):
             return await interaction.response.send_message("This works only inside the server.", ephemeral=True)
         if not is_staff(interaction.user) and not interaction.user.guild_permissions.administrator:
             return await interaction.response.send_message("❎ You are not staff.", ephemeral=True)
-        embed = discord.Embed(title="✅ Problem Marked Solved",
-                              description=f"Marked solved by {interaction.user.mention}",
-                              color=discord.Color.green(),
-                              timestamp=datetime.now(timezone.utc))
+        embed = discord.Embed(
+            title="✅ Problem Marked Solved",
+            description=f"Marked solved by {interaction.user.mention}",
+            color=discord.Color.green(),
+            timestamp=datetime.now(timezone.utc)
+        )
         embed.add_field(name="Time", value=now_ts())
         await interaction.channel.send(embed=embed)
         await interaction.response.send_message("✅ Marked solved.", ephemeral=True)
@@ -148,17 +152,19 @@ class TicketView(ui.View):
             return await interaction.response.send_message("❎ You are not staff.", ephemeral=True)
         if not OPENAI_API_KEY or openai is None:
             return await interaction.response.send_message("❎ OpenAI not configured.", ephemeral=True)
+
         await interaction.response.defer(ephemeral=True, thinking=True)
 
         msgs = []
         async for m in interaction.channel.history(limit=30, oldest_first=False):
             if m.author.bot:
                 continue
-            msgs.append(f"{m.author.name}: {m.content}")
+            # include attachments as text marker
+            content = m.content or ("[attachment]" if m.attachments else "")
+            msgs.append(f"{m.author.name}: {content}")
         convo = "\n".join(reversed(msgs[:30]))
         prompt = (
-            "You are a professional support assistant. Given the conversation, draft "
-            "a short professional reply staff can paste to the user.\n\n"
+            "You are a professional support assistant. Given the conversation, draft a short professional reply staff can paste to the user.\n\n"
             f"Conversation:\n{convo}\n\nReply:"
         )
         try:
@@ -181,10 +187,12 @@ class TicketView(ui.View):
             return await interaction.response.send_message("❎ You are not staff.", ephemeral=True)
 
         await interaction.response.send_message("✅ Closing ticket — channel will be deleted in 5 seconds.", ephemeral=True)
-        final_embed = discord.Embed(title="🗑️ Ticket Closed",
-                                    description=f"Closed by {interaction.user.mention}",
-                                    color=discord.Color.dark_gray(),
-                                    timestamp=datetime.now(timezone.utc))
+        final_embed = discord.Embed(
+            title="🗑️ Ticket Closed",
+            description=f"Closed by {interaction.user.mention}",
+            color=discord.Color.dark_gray(),
+            timestamp=datetime.now(timezone.utc)
+        )
         final_embed.add_field(name="Time", value=now_ts())
         await interaction.channel.send(embed=final_embed)
 
@@ -204,7 +212,7 @@ class TicketView(ui.View):
             pass
 
 # -------------------------------
-# Channel creation helper
+# Create ticket channel helper
 # -------------------------------
 async def create_ticket_channel(guild: discord.Guild, user: discord.User):
     cat = guild.get_channel(data.get("category_id")) if data.get("category_id") else None
@@ -222,21 +230,22 @@ async def create_ticket_channel(guild: discord.Guild, user: discord.User):
         ch = await cat.create_text_channel(channel_name, overwrites=overwrites, reason="Modmail ticket created")
     else:
         ch = await guild.create_text_channel(channel_name, overwrites=overwrites, reason="Modmail ticket created")
+
     data["tickets"][str(user.id)] = ch.id
     save_data(data)
     return ch
 
 # -------------------------------
-# on_message: DM handling & keyword checks
+# Message handling (DM -> ticket, keyword handling)
 # -------------------------------
 @bot.event
 async def on_message(message: discord.Message):
-    await bot.process_commands(message)  # allow commands
+    await bot.process_commands(message)  # keep commands working
 
     if message.author.bot:
         return
 
-    # DM -> create/forward ticket
+    # 1) DM -> create / forward ticket
     if isinstance(message.channel, discord.DMChannel):
         user = message.author
         acct_days = (datetime.now(timezone.utc) - user.created_at).days
@@ -257,10 +266,12 @@ async def on_message(message: discord.Message):
         channel = guild.get_channel(ch_id) if ch_id else None
         if not channel:
             channel = await create_ticket_channel(guild, user)
-            embed = discord.Embed(title="📩 New Ticket",
-                                  description=f"Ticket created by {user.mention} ({user.id})",
-                                  color=discord.Color.blurple(),
-                                  timestamp=datetime.now(timezone.utc))
+            embed = discord.Embed(
+                title="📩 New Ticket",
+                description=f"Ticket created by {user.mention} ({user.id})",
+                color=discord.Color.blurple(),
+                timestamp=datetime.now(timezone.utc)
+            )
             embed.add_field(name="Account Age (days)", value=str(acct_days), inline=False)
             embed.add_field(name="Created", value=now_ts(), inline=False)
             try:
@@ -272,7 +283,13 @@ async def on_message(message: discord.Message):
             except Exception:
                 pass
 
-        forward = discord.Embed(title=f"📨 Message from {user}", description=message.content or "[attachment]", color=discord.Color.green(), timestamp=datetime.now(timezone.utc))
+        # forward message content & attachments
+        forward = discord.Embed(
+            title=f"📨 Message from {user}",
+            description=message.content or "[attachment]",
+            color=discord.Color.green(),
+            timestamp=datetime.now(timezone.utc)
+        )
         forward.set_footer(text=f"User ID: {user.id} • {now_ts()}")
         files = []
         for att in message.attachments:
@@ -289,7 +306,7 @@ async def on_message(message: discord.Message):
             pass
         return
 
-    # In-guild: check ticket channels for keyword actions (only PRIMARY_GUILD_ID)
+    # 2) In-guild messages: check ticket channels for keyword actions
     if message.guild and message.guild.id == PRIMARY_GUILD_ID:
         ch_id = message.channel.id
         if ch_id in list(data.get("tickets", {}).values()):
@@ -302,7 +319,12 @@ async def on_message(message: discord.Message):
             matched_solve = (content == solve_kw) or content.startswith(solve_kw)
             matched_close = (content == close_kw) or content.startswith(close_kw)
             if matched_solve:
-                embed = discord.Embed(title="✅ Problem Marked Solved", description=f"Marked solved by {member.mention}", color=discord.Color.green(), timestamp=datetime.now(timezone.utc))
+                embed = discord.Embed(
+                    title="✅ Problem Marked Solved",
+                    description=f"Marked solved by {member.mention}",
+                    color=discord.Color.green(),
+                    timestamp=datetime.now(timezone.utc)
+                )
                 embed.add_field(name="Time", value=now_ts())
                 await message.channel.send(embed=embed)
                 try:
@@ -310,7 +332,12 @@ async def on_message(message: discord.Message):
                 except Exception:
                     pass
             elif matched_close:
-                embed = discord.Embed(title="🗑️ Ticket Closed", description=f"Closed by {member.mention}", color=discord.Color.dark_gray(), timestamp=datetime.now(timezone.utc))
+                embed = discord.Embed(
+                    title="🗑️ Ticket Closed",
+                    description=f"Closed by {member.mention}",
+                    color=discord.Color.dark_gray(),
+                    timestamp=datetime.now(timezone.utc)
+                )
                 embed.add_field(name="Time", value=now_ts())
                 await message.channel.send(embed=embed)
                 to_remove = None
@@ -328,7 +355,7 @@ async def on_message(message: discord.Message):
                     pass
 
 # -------------------------------
-# Slash commands (registered to primary guild)
+# Slash commands (registered to PRIMARY_GUILD_ID)
 # -------------------------------
 @bot.tree.command(name="set_category", description="Set the category where ticket channels will be created (admin only).")
 async def set_category(interaction: discord.Interaction, category: discord.CategoryChannel):
@@ -403,14 +430,14 @@ async def force_close(interaction: discord.Interaction):
         pass
 
 # -------------------------------
-# Owner-only: restart & refresh
+# Owner-only commands: restart & refresh
 # -------------------------------
 @bot.tree.command(name="restart", description="Restart the bot (owner only).")
 async def restart(interaction: discord.Interaction):
     if interaction.user.id != OWNER_ID:
         return await interaction.response.send_message("❎ Owner only.", ephemeral=True)
     await interaction.response.send_message("🔄 Restarting bot now...", ephemeral=True)
-    await asyncio.sleep(1)
+    await asyncio.sleep(1)  # ensure response is delivered
     try:
         python = sys.executable
         os.execv(python, [python] + sys.argv)
@@ -430,7 +457,7 @@ async def refresh(interaction: discord.Interaction):
         await interaction.followup.send(f"❎ Sync error: {e}", ephemeral=True)
 
 # -------------------------------
-# on_ready: sync (primary guild) & DM owner
+# on_ready: register guild-only commands & DM owner
 # -------------------------------
 @bot.event
 async def on_ready():
@@ -455,7 +482,7 @@ async def on_ready():
         print(f"⚠️ Could not DM owner: {e}")
 
 # -------------------------------
-# Run
+# Run the bot
 # -------------------------------
 if __name__ == "__main__":
     print("Starting modmail bot...")
