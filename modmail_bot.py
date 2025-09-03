@@ -22,24 +22,19 @@ except Exception:
 from dotenv import load_dotenv
 load_dotenv()
 
-# Accept multiple token env names to avoid confusion
-DISCORD_TOKEN = (
+# Token/env loading (accept a few common names)
+TOKEN = (
     os.getenv("DISCORD_BOT_TOKEN")
     or os.getenv("DISCORD_TOKEN")
     or os.getenv("TOKEN")
 )
-# Primary guild default (your provided guild)
-DEFAULT_GUILD_ID = "1364371104755613837"
-PRIMARY_GUILD_ID = int(os.getenv("PRIMARY_GUILD_ID", DEFAULT_GUILD_ID))
-
-# Owner ID default (yours)
+PRIMARY_GUILD_ID = int(os.getenv("PRIMARY_GUILD_ID", "1364371104755613837"))
 OWNER_ID = int(os.getenv("OWNER_ID", "1319292111325106296"))
-
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")  # optional
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 # Basic validation
-if not DISCORD_TOKEN:
-    print("❌ ERROR: No Discord token found. Set DISCORD_BOT_TOKEN or DISCORD_TOKEN in environment.")
+if not TOKEN:
+    print("❌ ERROR: No Discord token found. Set DISCORD_BOT_TOKEN in environment.")
     sys.exit(1)
 
 if OPENAI_API_KEY and openai:
@@ -55,7 +50,7 @@ def home():
     return "Modmail bot running."
 
 def run_flask():
-    port = int(os.environ.get("PORT", 8080))
+    port = int(os.getenv("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
 
 Thread(target=run_flask, daemon=True).start()
@@ -159,7 +154,6 @@ class TicketView(ui.View):
         async for m in interaction.channel.history(limit=30, oldest_first=False):
             if m.author.bot:
                 continue
-            # include attachments as text marker
             content = m.content or ("[attachment]" if m.attachments else "")
             msgs.append(f"{m.author.name}: {content}")
         convo = "\n".join(reversed(msgs[:30]))
@@ -240,7 +234,7 @@ async def create_ticket_channel(guild: discord.Guild, user: discord.User):
 # -------------------------------
 @bot.event
 async def on_message(message: discord.Message):
-    await bot.process_commands(message)  # keep commands working
+    await bot.process_commands(message)  # keep prefix commands working
 
     if message.author.bot:
         return
@@ -430,23 +424,41 @@ async def force_close(interaction: discord.Interaction):
         pass
 
 # -------------------------------
-# Owner-only commands: restart & refresh
+# Owner-only commands: restart & refresh (both prefix + slash)
 # -------------------------------
-@bot.tree.command(name="restart", description="Restart the bot (owner only).")
-async def restart(interaction: discord.Interaction):
-    if interaction.user.id != OWNER_ID:
-        return await interaction.response.send_message("❎ Owner only.", ephemeral=True)
-    await interaction.response.send_message("🔄 Restarting bot now...", ephemeral=True)
-    await asyncio.sleep(1)  # ensure response is delivered
+# Prefix: !refresh
+@bot.command(name="refresh")
+async def refresh_prefix(ctx: commands.Context):
+    if ctx.author.id != OWNER_ID:
+        return await ctx.send("❎ Owner only.")
+    try:
+        guild_obj = discord.Object(id=PRIMARY_GUILD_ID)
+        synced = await bot.tree.sync(guild=guild_obj)
+        msg = f"✅ Refreshed {len(synced)} commands for guild {PRIMARY_GUILD_ID}"
+        print(msg)
+        await ctx.send(msg)
+    except Exception as e:
+        err = f"❌ Refresh failed: {e}"
+        print(err)
+        await ctx.send(err)
+
+# Prefix: !restart
+@bot.command(name="restart")
+async def restart_prefix(ctx: commands.Context):
+    if ctx.author.id != OWNER_ID:
+        return await ctx.send("❎ Owner only.")
+    await ctx.send("🔄 Restarting bot now...")
+    await asyncio.sleep(1)
     try:
         python = sys.executable
         os.execv(python, [python] + sys.argv)
     except Exception as e:
-        await interaction.followup.send(f"❎ Restart failed: {e}. Exiting instead.", ephemeral=True)
+        await ctx.send(f"❌ Restart failed: {e}. Exiting instead.")
         sys.exit(0)
 
+# Slash: /refresh
 @bot.tree.command(name="refresh", description="Refresh/sync slash commands for primary guild (owner only).")
-async def refresh(interaction: discord.Interaction):
+async def refresh_slash(interaction: discord.Interaction):
     if interaction.user.id != OWNER_ID:
         return await interaction.response.send_message("❎ Owner only.", ephemeral=True)
     await interaction.response.send_message("🔁 Refreshing commands for primary guild...", ephemeral=True)
@@ -454,7 +466,21 @@ async def refresh(interaction: discord.Interaction):
         synced = await bot.tree.sync(guild=discord.Object(id=PRIMARY_GUILD_ID))
         await interaction.followup.send(f"✅ Synced {len(synced)} commands to primary guild — {now_ts()}", ephemeral=True)
     except Exception as e:
-        await interaction.followup.send(f"❎ Sync error: {e}", ephemeral=True)
+        await interaction.followup.send(f"❌ Sync error: {e}", ephemeral=True)
+
+# Slash: /restart
+@bot.tree.command(name="restart", description="Restart the bot (owner only).")
+async def restart_slash(interaction: discord.Interaction):
+    if interaction.user.id != OWNER_ID:
+        return await interaction.response.send_message("❎ Owner only.", ephemeral=True)
+    await interaction.response.send_message("🔄 Restarting bot now...", ephemeral=True)
+    await asyncio.sleep(1)
+    try:
+        python = sys.executable
+        os.execv(python, [python] + sys.argv)
+    except Exception as e:
+        await interaction.followup.send(f"❎ Restart failed: {e}. Exiting instead.", ephemeral=True)
+        sys.exit(0)
 
 # -------------------------------
 # on_ready: register guild-only commands & DM owner
@@ -486,4 +512,4 @@ async def on_ready():
 # -------------------------------
 if __name__ == "__main__":
     print("Starting modmail bot...")
-    bot.run(DISCORD_TOKEN)
+    bot.run(TOKEN)
