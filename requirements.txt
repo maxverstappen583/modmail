@@ -1,6 +1,5 @@
-discord.py>=2.3.2
-Flask
-python-dotenv
-aiohttp
-Pillow
-openai
+discord.py==2.4.0
+Pillow==10.1.0
+aiohttp==3.9.4
+Flask==2.3.2
+python-dotenv==1.0.0
