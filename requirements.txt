@@ -1,4 +1,6 @@
 discord.py>=2.3.2
 Flask
 python-dotenv
+aiohttp
+Pillow
 openai
