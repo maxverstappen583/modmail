@@ -11,6 +11,14 @@
 
 import os
 import sys
+
+# 🔧 Patch for Python 3.13 – replace missing audioop with audioop-lts
+try:
+    import audioop_lts
+    sys.modules["audioop"] = audioop_lts
+except ImportError:
+    pass
+    
 import json
 import asyncio
 import aiohttp
