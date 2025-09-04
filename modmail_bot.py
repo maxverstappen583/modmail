@@ -1,15 +1,16 @@
 # modmail_bot.py
-# Full modmail bot (drop-in). Read comments slowly and deploy.
+# Modmail bot — staff-only ticket channels (user cannot see ticket channel),
+# user must reply via DMs. 15s countdown confirm, attachments forwarded,
+# HTML transcript posted to a configured log channel, both prefix (!) and slash (/)
+# commands, Flask keepalive, persistent JSON storage, and owner tools.
 
-# ---- small patch for Python 3.13 hosts that lack audioop (Render sometimes uses 3.13) ----
+# Patch audioop on Python 3.13 hosts (Render sometimes runs 3.13)
 import sys
 try:
-    # audioop-lts provides a drop-in replacement for audioop on Python 3.13+
     import audioop_lts as _audioop_lts
     sys.modules["audioop"] = _audioop_lts
 except Exception:
-    # if not installed, continue — discord.py may still import audioop and fail,
-    # so ensure audioop-lts is in requirements.txt on hosts that need it.
+    # audioop-lts may not be installed in local dev; include it in requirements on host
     pass
 
 import os
@@ -25,38 +26,37 @@ from discord.ext import commands
 from discord import ui
 from flask import Flask
 
-# Pillow (PIL) for color extraction
+# Pillow for avatar color extraction
 from PIL import Image
 
-# optional dotenv
+# dotenv optional locally
 try:
     from dotenv import load_dotenv
     load_dotenv()
 except Exception:
     pass
 
-# -----------------------------
-# Environment / basic config
-# -----------------------------
+# -------------------------
+# ENV / basic config
+# -------------------------
 DISCORD_TOKEN = (
     os.getenv("DISCORD_TOKEN")
     or os.getenv("DISCORD_BOT_TOKEN")
     or os.getenv("TOKEN")
 )
-# replace default with your guild id if you want to hardcode
 PRIMARY_GUILD_ID = int(os.getenv("PRIMARY_GUILD_ID", "1364371104755613837"))
 OWNER_ID = int(os.getenv("OWNER_ID", "1319292111325106296"))
 PORT = int(os.getenv("PORT", "10000"))
 
 if not DISCORD_TOKEN:
-    print("ERROR: DISCORD_TOKEN environment variable not set.")
+    print("❌ ERROR: set DISCORD_TOKEN in environment.")
     raise SystemExit(1)
 
 print("Using DISCORD_TOKEN from environment.")
 
-# -----------------------------
-# Flask keepalive for hosting
-# -----------------------------
+# -------------------------
+# Flask keepalive
+# -------------------------
 app = Flask("modmail_keepalive")
 
 @app.route("/")
@@ -68,9 +68,9 @@ def run_flask():
 
 Thread(target=run_flask, daemon=True).start()
 
-# -----------------------------
-# Persistence
-# -----------------------------
+# -------------------------
+# Data persistence
+# -------------------------
 DATA_FILE = "modmail_data.json"
 DEFAULT_DATA = {
     "category_id": None,
@@ -88,7 +88,6 @@ def load_data():
         return DEFAULT_DATA.copy()
     with open(DATA_FILE, "r", encoding="utf-8") as f:
         d = json.load(f)
-    # ensure keys
     for k, v in DEFAULT_DATA.items():
         if k not in d:
             d[k] = v
@@ -100,15 +99,14 @@ def save_data(d):
 
 data = load_data()
 
-# in-memory session logs for transcripts: channel_id -> list of entries
-# entry: {"author_name","author_id","avatar_url","color","content","attachments":[{"filename","url"}],"ts"}
+# In-memory session logs: channel_id -> list of entries
+# Entry: {"author_name","author_id","avatar_url","color","content","attachments":[{"filename","url"}],"ts"}
 session_logs = {}
 
-# -----------------------------
-# helpers: time / http / color
-# -----------------------------
-def now_ts():
-    # dd/mm/yy, 12-hour format with AM/PM
+# -------------------------
+# Helpers: time, http, color
+# -------------------------
+def now_ts() -> str:
     return datetime.now(timezone.utc).strftime("%d/%m/%y, %I:%M %p")
 
 async def fetch_bytes(url: str):
@@ -131,30 +129,29 @@ def dominant_color_from_bytes(b: bytes):
         colors.sort(reverse=True, key=lambda x: x[0])
         for count, col in colors:
             r,g,b = col
-            # skip very light (likely background)
+            # skip very light colors (likely background)
             if not (r > 240 and g > 240 and b > 240):
                 return col
         return colors[0][1]
     except Exception:
         return (120,120,120)
 
-async def get_user_color(user: discord.User):
-    # Try accent/banner color via fetch, else dominant color from avatar, else fallback
+async def get_user_color(user: discord.User) -> discord.Color:
+    # Try to fetch accent color / banner via full user fetch
     try:
         full = await user.fetch()
-        ac = getattr(full, "accent_color", None)
-        if ac:
+        accent = getattr(full, "accent_color", None)
+        if accent:
             try:
-                # accent_color may already be discord.Color
-                if isinstance(ac, discord.Color):
-                    return ac
-                # if int
-                return discord.Color(ac)
+                if isinstance(accent, discord.Color):
+                    return accent
+                return discord.Color(accent)
             except Exception:
                 pass
     except Exception:
         pass
 
+    # fallback to avatar dominant color
     try:
         url = str(user.display_avatar.url)
         b = await fetch_bytes(url)
@@ -166,7 +163,7 @@ async def get_user_color(user: discord.User):
 
     return discord.Color.dark_grey()
 
-def color_to_hex(color):
+def color_to_hex(color) -> str:
     try:
         if isinstance(color, discord.Color):
             return "#{:06x}".format(color.value)
@@ -178,7 +175,7 @@ def color_to_hex(color):
         pass
     return "#777777"
 
-def mention_to_id(s):
+def mention_to_id(s: str | None) -> int | None:
     if not s:
         return None
     s = s.strip()
@@ -197,9 +194,9 @@ async def try_dm(user: discord.User, text: str):
     except Exception:
         pass
 
-# -----------------------------
-# bot creation (must come before decorators)
-# -----------------------------
+# -------------------------
+# Bot creation
+# -------------------------
 intents = discord.Intents.default()
 intents.guilds = True
 intents.members = True
@@ -208,19 +205,19 @@ intents.message_content = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# -----------------------------
-# embed/card builder
-# -----------------------------
-def build_card(author_name: str, avatar_url: str, color: discord.Color, content: str, ts_str: str):
+# -------------------------
+# Card builder (styled embed)
+# -------------------------
+def build_card(author_name: str, avatar_url: str, color: discord.Color, content: str, ts_str: str) -> discord.Embed:
     embed = discord.Embed(description=content or " ", color=color)
     embed.set_author(name=author_name, icon_url=avatar_url)
     embed.set_footer(text=ts_str)
     return embed
 
-# -----------------------------
-# transcript HTML generator
-# -----------------------------
-def generate_html_transcript(channel: discord.TextChannel, entries: list):
+# -------------------------
+# HTML transcript generator
+# -------------------------
+def generate_html_transcript(channel: discord.TextChannel, entries: list) -> str:
     os.makedirs("transcripts", exist_ok=True)
     ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     filename = f"transcripts/transcript_{channel.id}_{ts}.html"
@@ -264,18 +261,15 @@ def generate_html_transcript(channel: discord.TextChannel, entries: list):
         f.write("\n".join(parts))
     return filename
 
-# -----------------------------
-# Logging helper: posts small events to log channel if set
-# -----------------------------
+# -------------------------
+# Logging helper: post small events to log channel if set
+# -------------------------
 async def log_event(guild: discord.Guild | None, title: str, description: str, channel_id: int | None = None):
     log_chan_id = data.get("log_channel_id")
     if not log_chan_id:
         return
     try:
-        # prefer passing guild channel when possible
-        log_chan = guild.get_channel(log_chan_id) if guild else bot.get_channel(log_chan_id)
-        if not log_chan:
-            log_chan = bot.get_channel(log_chan_id)
+        log_chan = (guild.get_channel(log_chan_id) if guild else bot.get_channel(log_chan_id)) or bot.get_channel(log_chan_id)
         if not log_chan:
             return
         embed = discord.Embed(title=title, description=description, color=discord.Color.blurple(), timestamp=datetime.now(timezone.utc))
@@ -285,14 +279,14 @@ async def log_event(guild: discord.Guild | None, title: str, description: str, c
     except Exception:
         pass
 
-# -----------------------------
-# ticket creation helper (robust)
-# -----------------------------
-async def create_ticket_channel_for_user(guild: discord.Guild, user: discord.User):
+# -------------------------
+# Create ticket channel helper (staff-only: user cannot see)
+# -------------------------
+async def create_ticket_channel_for_user(guild: discord.Guild, user: discord.User) -> discord.TextChannel | None:
     cat_id = data.get("category_id")
     category = guild.get_channel(cat_id) if cat_id else None
     if not category or not isinstance(category, discord.CategoryChannel):
-        # no valid category configured → inform admins and user fallback
+        # notify user and admin situation
         try:
             await try_dm(user, "❌ Ticket category is not set or invalid. Ask an admin to run `!setup`.")
         except Exception:
@@ -301,24 +295,21 @@ async def create_ticket_channel_for_user(guild: discord.Guild, user: discord.Use
 
     staff_role = guild.get_role(data.get("staff_role_id")) if data.get("staff_role_id") else None
 
+    # Overwrites: default_role cannot view, bot and staff role can view.
     overwrites = {
         guild.default_role: discord.PermissionOverwrite(view_channel=False),
         guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
     }
 
-    # if the user is a member in the guild, allow them to see their own ticket
-    member = guild.get_member(user.id)
-    if member:
-        overwrites[member] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
-
     if staff_role:
         overwrites[staff_role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
 
+    # Note: intentionally NOT giving the ticket author view permissions.
     channel_name = f"ticket-{user.id}"
     try:
-        ch = await category.create_text_channel(channel_name, overwrites=overwrites, reason="Modmail ticket created")
+        ch = await category.create_text_channel(channel_name, overwrites=overwrites, reason="Modmail ticket created (staff-only)")
     except Exception:
-        # fallback: try creating at guild root
+        # fallback to guild root if category creation fails
         try:
             ch = await guild.create_text_channel(channel_name, overwrites=overwrites, reason="Modmail ticket created (fallback)")
         except Exception:
@@ -330,16 +321,16 @@ async def create_ticket_channel_for_user(guild: discord.Guild, user: discord.Use
     await log_event(guild, "Ticket Created", f"Ticket channel {ch.mention} created for {user} ({user.id}).", ch.id)
     return ch
 
-# -----------------------------
-# DM confirmation view (15s countdown with editing)
-# -----------------------------
+# -------------------------
+# DM confirmation view w/ countdown (15..14..13..)
+# -------------------------
 class DMConfirmView(ui.View):
     def __init__(self, user: discord.User, orig_message: discord.Message, timeout: int = 15):
         super().__init__(timeout=timeout)
         self.user = user
         self.orig_message = orig_message
-        self._message = None
-        self._task = None
+        self._message: discord.Message | None = None
+        self._task: asyncio.Task | None = None
         self._confirmed = False
         self._cancelled = False
         self._timeout = timeout
@@ -370,7 +361,7 @@ class DMConfirmView(ui.View):
                 remaining -= 1
                 if self._confirmed or self._cancelled or self.is_finished():
                     return
-            # timed out
+            # timeout
             if not self._confirmed:
                 self._cancelled = True
                 try:
@@ -415,15 +406,14 @@ class DMConfirmView(ui.View):
             self.stop()
             return
 
-        # prepare attachments and metadata
+        # prepare files + meta
         files = []
         att_meta = []
         for att in self.orig_message.attachments:
             try:
-                url = att.url
                 f = await att.to_file()
                 files.append(f)
-                att_meta.append({"filename": f.filename, "url": url})
+                att_meta.append({"filename": f.filename, "url": att.url})
             except Exception:
                 pass
 
@@ -437,13 +427,13 @@ class DMConfirmView(ui.View):
 
         try:
             if files:
+                # Add TicketView so staff can use buttons
                 await ch.send(embed=card, files=files, view=TicketView(ticket_user_id=self.user.id))
             else:
                 await ch.send(embed=card, view=TicketView(ticket_user_id=self.user.id))
         except Exception:
             pass
 
-        # log the initial message to session_logs
         session_logs.setdefault(ch.id, []).append({
             "author_name": str(self.user),
             "author_id": self.user.id,
@@ -455,7 +445,7 @@ class DMConfirmView(ui.View):
         })
 
         try:
-            await interaction.followup.send(f"✅ Ticket created: {ch.mention}. Staff will respond there.", ephemeral=True)
+            await interaction.followup.send(f"✅ Ticket created. Staff will respond; reply to the bot in DMs to continue the conversation.", ephemeral=True)
         except Exception:
             pass
 
@@ -486,9 +476,9 @@ class DMConfirmView(ui.View):
             pass
         self.stop()
 
-# -----------------------------
-# TicketView for staff buttons
-# -----------------------------
+# -------------------------
+# Ticket view (staff buttons)
+# -------------------------
 class TicketView(ui.View):
     def __init__(self, ticket_user_id: int, timeout: int | None = None):
         super().__init__(timeout=timeout)
@@ -501,7 +491,7 @@ class TicketView(ui.View):
         embed = discord.Embed(title="✅ Problem Marked Solved", description=f"Marked solved by {interaction.user.mention}", color=discord.Color.green())
         embed.add_field(name="Time", value=now_ts())
         await interaction.channel.send(embed=embed)
-        # DM user and log
+        # DM user
         ch_id = interaction.channel.id
         uid = None
         for k,v in data.get("tickets", {}).items():
@@ -535,7 +525,6 @@ class TicketView(ui.View):
         try:
             path = generate_html_transcript(ch, logs)
             await log_event(ch.guild, "Ticket Closed", f"Ticket channel {ch.name} ({ch.id}) closed by {interaction.user}.", ch.id)
-            # send transcript to configured log channel if set
             log_chan_id = data.get("log_channel_id")
             if log_chan_id:
                 try:
@@ -546,7 +535,6 @@ class TicketView(ui.View):
                     pass
         except Exception:
             pass
-        # remove mapping
         removed_uid = None
         for uid,cid in list(data.get("tickets", {}).items()):
             if cid == ch_id:
@@ -561,16 +549,18 @@ class TicketView(ui.View):
         except Exception:
             pass
 
-# -----------------------------
-# Message handling: DMs and ticket channels
-# -----------------------------
+# -------------------------
+# Message handler
+# -------------------------
 @bot.event
 async def on_message(message: discord.Message):
     await bot.process_commands(message)
     if message.author.bot:
         return
 
-    # DMs
+    # -------------------------
+    # DMs -> new ticket or forward to existing ticket
+    # -------------------------
     if isinstance(message.channel, discord.DMChannel):
         user = message.author
         acct_days = (datetime.now(timezone.utc) - user.created_at).days
@@ -591,16 +581,15 @@ async def on_message(message: discord.Message):
         channel = guild.get_channel(ch_id) if ch_id else None
 
         if channel:
-            # forward to existing ticket
+            # forward to existing staff-only ticket
             color = await get_user_color(user)
             files = []
             att_meta = []
             for att in message.attachments:
                 try:
-                    url = att.url
                     f = await att.to_file()
                     files.append(f)
-                    att_meta.append({"filename": f.filename, "url": url})
+                    att_meta.append({"filename": f.filename, "url": att.url})
                 except Exception:
                     pass
             card = build_card(str(user), str(user.display_avatar.url), color, message.content or "[attachment]", now_ts())
@@ -627,7 +616,7 @@ async def on_message(message: discord.Message):
             })
             return
 
-        # No ticket yet -> confirmation dialog with countdown
+        # no ticket → confirmation with 15s countdown
         confirm_embed = discord.Embed(title="Confirm: Create Support Ticket?", description=message.content or "[attachment]", color=discord.Color.gold())
         try:
             confirm_embed.set_thumbnail(url=user.display_avatar.url)
@@ -653,15 +642,16 @@ async def on_message(message: discord.Message):
             pass
         return
 
-    # In-guild ticket channels
+    # -------------------------
+    # In-guild ticket channels -> staff replies forwarded to user
+    # -------------------------
     if message.guild and message.guild.id == PRIMARY_GUILD_ID:
         ch_id = message.channel.id
         tickets_map = data.get("tickets", {})
         if ch_id in list(tickets_map.values()):
             member = message.author
-            # staff-only forwarding
             if not (is_staff(member) or member.guild_permissions.administrator):
-                return
+                return  # only staff/admin may post/forward in ticket channels
 
             content = message.content or ""
             solve_kw = (data.get("solve_keyword") or "solved").lower().strip()
@@ -706,7 +696,6 @@ async def on_message(message: discord.Message):
                 logs = session_logs.get(ch_id, [])
                 try:
                     path = generate_html_transcript(message.channel, logs)
-                    # post transcript to configured log channel (if set)
                     log_chan_id = data.get("log_channel_id")
                     if log_chan_id:
                         try:
@@ -717,7 +706,6 @@ async def on_message(message: discord.Message):
                             pass
                 except Exception:
                     pass
-                # remove mapping and delete
                 removed_uid = None
                 for uid,cid in list(tickets_map.items()):
                     if cid == ch_id:
@@ -734,7 +722,7 @@ async def on_message(message: discord.Message):
                 await log_event(message.guild, "Ticket Closed", f"Ticket {message.channel.name} ({ch_id}) closed by {member}.", ch_id)
                 return
 
-            # normal staff message -> forward to user
+            # normal staff message -> forward to user DMs
             target_uid = None
             for uid,cid in tickets_map.items():
                 if cid == ch_id:
@@ -746,10 +734,9 @@ async def on_message(message: discord.Message):
                     att_meta = []
                     for att in message.attachments:
                         try:
-                            url = att.url
                             f = await att.to_file()
                             files.append(f)
-                            att_meta.append({"filename": f.filename, "url": url})
+                            att_meta.append({"filename": f.filename, "url": att.url})
                         except Exception:
                             pass
                     staff_color = member.color or discord.Color.dark_grey()
@@ -783,18 +770,18 @@ async def on_message(message: discord.Message):
                         pass
                 return
 
-# -----------------------------
+# -------------------------
 # is_staff helper
-# -----------------------------
-def is_staff(member: discord.Member):
+# -------------------------
+def is_staff(member: discord.Member) -> bool:
     r_id = data.get("staff_role_id")
     if not r_id:
         return False
     return any(r.id == r_id for r in member.roles)
 
-# -----------------------------
+# -------------------------
 # Commands (prefix & slash)
-# -----------------------------
+# -------------------------
 @bot.tree.command(name="setup", description="Set ticket category and staff role (admin only).")
 async def setup_slash(interaction: discord.Interaction, category: discord.CategoryChannel, staff_role: discord.Role):
     if not interaction.user.guild_permissions.administrator:
@@ -818,7 +805,7 @@ async def setup_prefix(ctx: commands.Context, category_arg: str, staff_role_arg:
     await ctx.send(f"✅ Category and staff role set. Category ID: `{cat_id}`, Role ID: `{role_id}`")
     await log_event(ctx.guild, "Settings Updated", f"Category set (ID {cat_id}), staff role set (ID {role_id}).")
 
-@bot.tree.command(name="set_log_channel", description="Set the log channel where transcripts/events are posted (admin only).")
+@bot.tree.command(name="set_log_channel", description="Set log channel where transcripts/events are posted (admin only).")
 async def set_log_channel_slash(interaction: discord.Interaction, channel: discord.TextChannel):
     if not interaction.user.guild_permissions.administrator:
         return await interaction.response.send_message("❎ Admins only.", ephemeral=True)
@@ -1009,7 +996,7 @@ async def refresh_prefix(ctx: commands.Context):
     except Exception as e:
         await ctx.send(f"❌ Refresh failed: {e}")
 
-@bot.tree.command(name="refresh", description="Refresh/sync slash commands for primary guild (owner only).")
+@bot.tree.command(name="refresh", description="Refresh/sync slash commands (owner only).")
 async def refresh_slash(interaction: discord.Interaction):
     if interaction.user.id != OWNER_ID:
         return await interaction.response.send_message("❎ Owner only.", ephemeral=True)
@@ -1054,14 +1041,14 @@ async def restart_slash(interaction: discord.Interaction):
         await interaction.followup.send(f"❌ Restart failed: {e}. Exiting instead.", ephemeral=True)
         sys.exit(0)
 
-# commands list/help
+# commands/help
 @bot.command(name="commands")
 async def commands_list_prefix(ctx: commands.Context):
     embed = discord.Embed(title="📚 Modmail Commands (prefix & slash)", color=discord.Color.blurple())
     embed.add_field(name="Setup", value="`!setup <category_id|#mention> <role_id|@mention>`\n`/setup category:<category> staff_role:<role>`", inline=False)
     embed.add_field(name="Set Log Channel", value="`!set_log_channel <#channel|id>`\n`/set_log_channel channel:<channel>`", inline=False)
     embed.add_field(name="Settings", value="`!settings` / `/settings`", inline=False)
-    embed.add_field(name="Ticket Flow", value="Users DM bot → confirm 15s → ticket created in category. Staff replies forward to user. Attachments forwarded.", inline=False)
+    embed.add_field(name="Ticket Flow", value="Users DM bot → confirm 15s → ticket created in category (staff-only). Staff replies forward to user DMs.", inline=False)
     embed.add_field(name="Owner Tools", value="`!refresh` `!restart`", inline=False)
     await ctx.send(embed=embed)
 
@@ -1071,20 +1058,20 @@ async def commands_list_slash(interaction: discord.Interaction):
     embed.add_field(name="Setup", value="`!setup <category_id|#mention> <role_id|@mention>`\n`/setup category:<category> staff_role:<role>`", inline=False)
     embed.add_field(name="Set Log Channel", value="`!set_log_channel <#channel|id>`\n`/set_log_channel channel:<channel>`", inline=False)
     embed.add_field(name="Settings", value="`!settings` / `/settings`", inline=False)
-    embed.add_field(name="Ticket Flow", value="Users DM bot → confirm 15s → ticket created in category. Staff replies forward to user. Attachments forwarded.", inline=False)
+    embed.add_field(name="Ticket Flow", value="Users DM bot → confirm 15s → ticket created in category (staff-only). Staff replies forward to user DMs.", inline=False)
     embed.add_field(name="Owner Tools", value="`!refresh` `!restart`", inline=False)
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
-# -----------------------------
-# on_ready: sync & owner DM
-# -----------------------------
+# -------------------------
+# on_ready: sync commands & DM owner
+# -------------------------
 @bot.event
 async def on_ready():
     try:
         synced = await bot.tree.sync(guild=discord.Object(id=PRIMARY_GUILD_ID))
         print(f"✅ Synced {len(synced)} commands to guild {PRIMARY_GUILD_ID}")
     except Exception as e:
-        print(f"⚠️ Guild sync failed: {e}. Trying global sync.")
+        print(f"⚠️ Guild sync failed: {e}. Trying global sync...")
         try:
             all_synced = await bot.tree.sync()
             print(f"✅ Globally synced {len(all_synced)} commands")
@@ -1098,9 +1085,9 @@ async def on_ready():
     except Exception:
         pass
 
-# -----------------------------
-# Run the bot
-# -----------------------------
+# -------------------------
+# Run
+# -------------------------
 if __name__ == "__main__":
     print("Starting modmail bot...")
     try:
